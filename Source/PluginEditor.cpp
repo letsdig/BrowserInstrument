@@ -18,6 +18,14 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
         {
             urlEditor.setText (loadedUrl, false);
             processorRef.setLastLoadedUrl (loadedUrl);
+        },
+        [this] (const juce::String& /*loadedUrl*/)
+        {
+            if (browser)
+            {
+                browser->evaluateJavascript (
+                    WebBridge::getInjectionScript (processorRef.getBridgeServer().getPort()));
+            }
         });
 
     addAndMakeVisible (*browser);
@@ -54,13 +62,13 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     addAndMakeVisible (urlEditor);
 
     // 3. Open in System Chrome Button
-    setupNavBtn (openChromeBtn, "Launch in System Google Chrome (App Mode)");
+    setupNavBtn (openChromeBtn, "Launch in System Google Chrome (App Mode with full GPU & WASM)");
     openChromeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1e3a8a));
     openChromeBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff93c5fd));
     openChromeBtn.onClick = [this] { openInSystemChrome(); };
 
     // 4. Download / Offline Button
-    setupNavBtn (downloadBtn, "Download current web instrument for offline use");
+    setupNavBtn (downloadBtn, "Download current web instrument for offline localhost use");
     downloadBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff065f46));
     downloadBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff6ee7b7));
     downloadBtn.onClick = [this] { downloadCurrentPageOffline(); };
@@ -94,6 +102,7 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
         addAndMakeVisible (btn);
     };
 
+    setupPresetBtn (cardinalBtn, "https://minicardinal.kx.studio/");
     setupPresetBtn (ypc2000Btn, "https://ypc2000.fun/");
     setupPresetBtn (acidMachineBtn, "https://acid-machine.com/");
     setupPresetBtn (webSynthsBtn, "https://websynths.com/");
@@ -101,7 +110,7 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
 
     // 7. Output Gain Slider
     gainSlider.setSliderStyle (juce::Slider::LinearHorizontal);
-    gainSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 50, 18);
+    gainSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 48, 18);
     gainSlider.setColour (juce::Slider::thumbColourId, juce::Colour (0xff6366f1));
     gainSlider.setColour (juce::Slider::trackColourId, juce::Colour (0xff2a2e3d));
     gainSlider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colour (0xff14161c));
@@ -112,10 +121,54 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     gainAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
         processorRef.getAPVTS(), "gain", gainSlider);
 
-    gainLabel.setText ("OUTPUT GAIN", juce::dontSendNotification);
+    gainLabel.setText ("GAIN", juce::dontSendNotification);
     gainLabel.setFont (juce::FontOptions (11.0f).withStyle ("Bold"));
     gainLabel.setColour (juce::Label::textColourId, juce::Colour (0xff9ca3af));
     addAndMakeVisible (gainLabel);
+
+    // 8. Test Note Button
+    testNoteBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2563eb));
+    testNoteBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    testNoteBtn.onClick = [this]
+    {
+        juce::MidiMessage on = juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100);
+        processorRef.getBridgeServer().sendMidiToBrowser (on);
+
+        if (browser)
+            browser->evaluateJavascript ("if (window.__JUCE_BRIDGE__) window.__JUCE_BRIDGE__.sendTestMidi(60, 100);");
+
+        juce::Timer::callAfterDelay (200, [this]
+        {
+            juce::MidiMessage off = juce::MidiMessage::noteOff (1, 60, (juce::uint8) 0);
+            processorRef.getBridgeServer().sendMidiToBrowser (off);
+        });
+    };
+    addAndMakeVisible (testNoteBtn);
+
+    // 9. PipeWire Direct Bitwig Link Button
+    pipewireLinkBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff0f766e));
+    pipewireLinkBtn.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff99f6e4));
+    pipewireLinkBtn.onClick = [this]
+    {
+        WebBridge::WebBridgeServer::pipewireLinkToBitwig();
+        statusMessage = "Linked PipeWire to Bitwig!";
+    };
+    addAndMakeVisible (pipewireLinkBtn);
+
+    // 10. Mute OS System Sound Toggle
+    muteOsToggle.setToggleState (true, juce::dontSendNotification);
+    muteOsToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffcbd5e1));
+    muteOsToggle.onClick = [this]
+    {
+        bool mute = muteOsToggle.getToggleState();
+        if (browser)
+        {
+            browser->evaluateJavascript (
+                "if (window.__JUCE_BRIDGE__) window.__JUCE_BRIDGE__.setMuteSystemAudio(" +
+                juce::String (mute ? "true" : "false") + ");");
+        }
+    };
+    addAndMakeVisible (muteOsToggle);
 
     // Initial navigation
     navigateTo (processorRef.getLastLoadedUrl());
@@ -157,19 +210,21 @@ void BrowserInstrumentAudioProcessorEditor::openInSystemChrome()
     if (targetUrl.isEmpty())
         targetUrl = "https://ypc2000.fun/";
 
-    // Check for google-chrome or chromium
     juce::String chromeBin = "/usr/bin/google-chrome";
     if (!juce::File (chromeBin).existsAsFile())
         chromeBin = "/usr/bin/chromium-browser";
     if (!juce::File (chromeBin).existsAsFile())
         chromeBin = "/usr/bin/chromium";
 
-    // Launch in Chrome App Mode for dedicated borderless window
-    juce::String cmd = chromeBin + " --app=\"" + targetUrl + "\" &";
+    processorRef.getBridgeServer().ensureChromeExtensionCreated();
+    auto extDir = WebBridge::WebBridgeServer::getChromeExtensionDirectory();
+
+    // Launch Chrome App Mode with auto-injected extension for full WebGL2 and WASM acceleration
+    juce::String cmd = chromeBin + " --load-extension=\"" + extDir.getFullPathName() + "\" --app=\"" + targetUrl + "\" &";
     int res = std::system (cmd.toRawUTF8());
     juce::ignoreUnused (res);
 
-    statusMessage = "Chrome App Mode Launched!";
+    statusMessage = "Chrome App Mode Launched (Full WebGL2 & WASM)!";
 }
 
 void BrowserInstrumentAudioProcessorEditor::downloadCurrentPageOffline()
@@ -192,7 +247,6 @@ void BrowserInstrumentAudioProcessorEditor::downloadCurrentPageOffline()
 
     statusMessage = "Downloading " + domain + " offline...";
 
-    // Run wget in background thread
     juce::Thread::launch ([this, targetUrl, offlineDir, domain]()
     {
         juce::String cmd = "wget -q -E -k -p -N -P \"" + offlineDir.getFullPathName() + "\" \"" + targetUrl + "\"";
@@ -243,7 +297,7 @@ void BrowserInstrumentAudioProcessorEditor::timerCallback()
     else if (midiOutFlashFrames > 0)
         midiOutFlashFrames--;
 
-    repaint (0, getHeight() - 32, getWidth(), 32);
+    repaint (0, getHeight() - 34, getWidth(), 34);
 }
 
 void BrowserInstrumentAudioProcessorEditor::paint (juce::Graphics& g)
@@ -253,29 +307,29 @@ void BrowserInstrumentAudioProcessorEditor::paint (juce::Graphics& g)
 
     // 1. Top bar background
     juce::ColourGradient topGrad (juce::Colour (0xff181a22), 0, 0,
-                                  juce::Colour (0xff101217), 0, 78, false);
+                                  juce::Colour (0xff101217), 0, 74, false);
     g.setGradientFill (topGrad);
-    g.fillRect (0, 0, w, 78);
+    g.fillRect (0, 0, w, 74);
 
     g.setColour (juce::Colour (0xff282c38));
-    g.drawHorizontalLine (77, 0.0f, (float)w);
+    g.drawHorizontalLine (73, 0.0f, (float)w);
 
     // 2. Bottom status bar background
-    juce::ColourGradient botGrad (juce::Colour (0xff101217), 0, (float)(h - 32),
+    juce::ColourGradient botGrad (juce::Colour (0xff101217), 0, (float)(h - 34),
                                   juce::Colour (0xff0a0b0e), 0, (float)h, false);
     g.setGradientFill (botGrad);
-    g.fillRect (0, h - 32, w, 32);
+    g.fillRect (0, h - 34, w, 34);
 
     g.setColour (juce::Colour (0xff202430));
-    g.drawHorizontalLine (h - 32, 0.0f, (float)w);
+    g.drawHorizontalLine (h - 34, 0.0f, (float)w);
 
     // Status Indicator: Connection to Browser Web Audio Bridge
     float statusX = 14.0f;
-    float statusY = (float)(h - 20);
+    float statusY = (float)(h - 22);
 
     juce::Colour dotCol = isConnected ? juce::Colour (0xff22c55e) : juce::Colour (0xfff59e0b);
     g.setColour (dotCol);
-    g.fillEllipse (statusX, statusY, 9.0f, 9.0f);
+    g.fillEllipse (statusX, statusY, 10.0f, 10.0f);
 
     g.setFont (juce::FontOptions (12.0f).withStyle ("SemiBold"));
     g.setColour (juce::Colour (0xffd1d5db));
@@ -284,30 +338,30 @@ void BrowserInstrumentAudioProcessorEditor::paint (juce::Graphics& g)
         statusText = statusMessage;
 
     g.drawText (statusText + " (Port " + juce::String (processorRef.getBridgeServer().getPort()) + ")",
-                (int)statusX + 16, h - 30, 280, 28, juce::Justification::centredLeft);
+                (int)statusX + 16, h - 31, 260, 28, juce::Justification::centredLeft);
 
     // MIDI IN LED
-    int midiInX = 330;
+    int midiInX = 295;
     juce::Colour midiInCol = (midiInFlashFrames > 0) ? juce::Colour (0xff38bdf8) : juce::Colour (0xff1f293d);
     g.setColour (midiInCol);
-    g.fillRoundedRectangle ((float)midiInX, (float)(h - 22), 12.0f, 12.0f, 3.0f);
+    g.fillRoundedRectangle ((float)midiInX, (float)(h - 23), 12.0f, 12.0f, 3.0f);
     g.setColour (juce::Colour (0xff9ca3af));
     g.setFont (juce::FontOptions (11.0f));
-    g.drawText ("MIDI IN", midiInX + 16, h - 30, 55, 28, juce::Justification::centredLeft);
+    g.drawText ("MIDI IN", midiInX + 16, h - 31, 55, 28, juce::Justification::centredLeft);
 
     // MIDI OUT LED
-    int midiOutX = 415;
+    int midiOutX = 375;
     juce::Colour midiOutCol = (midiOutFlashFrames > 0) ? juce::Colour (0xfffb923c) : juce::Colour (0xff33251c);
     g.setColour (midiOutCol);
-    g.fillRoundedRectangle ((float)midiOutX, (float)(h - 22), 12.0f, 12.0f, 3.0f);
+    g.fillRoundedRectangle ((float)midiOutX, (float)(h - 23), 12.0f, 12.0f, 3.0f);
     g.setColour (juce::Colour (0xff9ca3af));
-    g.drawText ("MIDI OUT", midiOutX + 16, h - 30, 60, 28, juce::Justification::centredLeft);
+    g.drawText ("MIDI OUT", midiOutX + 16, h - 31, 60, 28, juce::Justification::centredLeft);
 
     // Audio Output Peak Meter
-    int meterX = 510;
-    int meterWidth = 140;
+    int meterX = 465;
+    int meterWidth = 130;
     int meterHeight = 10;
-    int meterY = h - 21;
+    int meterY = h - 22;
 
     g.setColour (juce::Colour (0xff181c26));
     g.fillRoundedRectangle ((float)meterX, (float)meterY, (float)meterWidth, (float)meterHeight, 2.0f);
@@ -323,7 +377,7 @@ void BrowserInstrumentAudioProcessorEditor::paint (juce::Graphics& g)
     }
 
     g.setColour (juce::Colour (0xff9ca3af));
-    g.drawText ("AUDIO OUT", meterX + meterWidth + 8, h - 30, 75, 28, juce::Justification::centredLeft);
+    g.drawText ("AUDIO OUT", meterX + meterWidth + 8, h - 31, 75, 28, juce::Justification::centredLeft);
 }
 
 void BrowserInstrumentAudioProcessorEditor::resized()
@@ -331,7 +385,7 @@ void BrowserInstrumentAudioProcessorEditor::resized()
     const int w = getWidth();
     const int h = getHeight();
 
-    // Row 1 (Navigation & Actions, y: 6 to 36)
+    // Row 1 (Navigation & Actions, y: 6 to 34, height: 28)
     int x = 8;
     const int r1Y = 6;
     const int btnH = 28;
@@ -341,9 +395,9 @@ void BrowserInstrumentAudioProcessorEditor::resized()
     forwardButton.setBounds (x, r1Y, 30, btnH);
     x += 34;
     reloadButton.setBounds (x, r1Y, 30, btnH);
-    x += 38;
+    x += 36;
 
-    int rightActionsWidth = 370;
+    const int rightActionsWidth = 370;
     int urlWidth = w - x - rightActionsWidth - 10;
     if (urlWidth < 180) urlWidth = 180;
 
@@ -359,31 +413,47 @@ void BrowserInstrumentAudioProcessorEditor::resized()
     downloadBtn.setBounds (x, r1Y, 105, btnH);
     x += 111;
 
-    offlineCombo.setBounds (x, r1Y, w - x - 8, btnH);
+    offlineCombo.setBounds (x, r1Y, juce::jmax (110, w - x - 8), btnH);
 
-    // Row 2 (Quick Presets, y: 40 to 70)
-    const int r2Y = 40;
-    const int r2H = 26;
+    // Row 2 (Quick Presets on Left, DAW Controls on Right, y: 39, height: 28)
+    const int r2Y = 39;
+    const int r2H = 28;
+
+    // Right-aligned DAW controls in Row 2:
+    const int pwBtnW = 165;
+    const int muteW = 120;
+    const int testW = 120;
+    const int rightControlsTotal = pwBtnW + muteW + testW + 16;
+
+    pipewireLinkBtn.setBounds (w - pwBtnW - 8, r2Y, pwBtnW, r2H);
+    muteOsToggle.setBounds (w - pwBtnW - muteW - 14, r2Y, muteW, r2H);
+    testNoteBtn.setBounds (w - pwBtnW - muteW - testW - 20, r2Y, testW, r2H);
+
+    // Left-aligned Quick Presets in Row 2:
+    int availPresetSpace = (w - rightControlsTotal - 16);
+    int presetW = juce::jlimit (75, 125, availPresetSpace / 5);
     int px = 8;
-    const int numPresets = 4;
-    const int presetW = juce::jmin (180, (w - 16) / numPresets);
 
-    ypc2000Btn.setBounds (px, r2Y, presetW - 6, r2H);
+    cardinalBtn.setBounds (px, r2Y, presetW - 4, r2H);
     px += presetW;
-    acidMachineBtn.setBounds (px, r2Y, presetW - 6, r2H);
+    ypc2000Btn.setBounds (px, r2Y, presetW - 4, r2H);
     px += presetW;
-    webSynthsBtn.setBounds (px, r2Y, presetW - 6, r2H);
+    acidMachineBtn.setBounds (px, r2Y, presetW - 4, r2H);
     px += presetW;
-    roland50Btn.setBounds (px, r2Y, presetW - 6, r2H);
+    webSynthsBtn.setBounds (px, r2Y, presetW - 4, r2H);
+    px += presetW;
+    roland50Btn.setBounds (px, r2Y, presetW - 4, r2H);
 
-    // Browser Component fills middle (from y: 78 to h - 32)
+    // Middle: Embedded Browser Component
+    const int topBarH = 74;
+    const int botBarH = 34;
     if (browser)
     {
-        browser->setBounds (0, 78, w, h - 78 - 32);
+        browser->setBounds (0, topBarH, w, h - topBarH - botBarH);
     }
 
-    // Bottom bar layout
-    int gainW = 160;
-    gainSlider.setBounds (w - gainW - 14, h - 28, gainW, 24);
-    gainLabel.setBounds (w - gainW - 100, h - 30, 90, 28);
+    // Bottom telemetry bar: Gain label and slider on right
+    int gainW = 150;
+    gainSlider.setBounds (w - gainW - 12, h - 29, gainW, 24);
+    gainLabel.setBounds (w - gainW - 80, h - 31, 65, 28);
 }

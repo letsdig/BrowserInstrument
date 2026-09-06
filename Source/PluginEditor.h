@@ -7,18 +7,25 @@
 class InstrumentBrowserComponent : public juce::WebBrowserComponent
 {
 public:
-    InstrumentBrowserComponent (const Options& options, std::function<void (const juce::String&)> onUrlChanged)
-        : WebBrowserComponent (options), urlChangedCallback (std::move (onUrlChanged))
+    InstrumentBrowserComponent (const Options& options,
+                                std::function<void (const juce::String&)> onUrlChanged,
+                                std::function<void (const juce::String&)> onPageFinished = nullptr)
+        : WebBrowserComponent (options),
+          urlChangedCallback (std::move (onUrlChanged)),
+          pageFinishedCallback (std::move (onPageFinished))
     {}
 
     void pageFinishedLoading (const juce::String& url) override
     {
         if (urlChangedCallback)
             urlChangedCallback (url);
+        if (pageFinishedCallback)
+            pageFinishedCallback (url);
     }
 
 private:
     std::function<void (const juce::String&)> urlChangedCallback;
+    std::function<void (const juce::String&)> pageFinishedCallback;
 };
 
 class BrowserInstrumentAudioProcessorEditor : public juce::AudioProcessorEditor,
@@ -53,12 +60,17 @@ private:
     juce::ComboBox offlineCombo;
 
     // Preset Quick Links
+    juce::TextButton cardinalBtn { "Cardinal Modular" };
     juce::TextButton ypc2000Btn { "YPC-2000" };
     juce::TextButton acidMachineBtn { "AcidMachine" };
     juce::TextButton webSynthsBtn { "WebSynths" };
     juce::TextButton roland50Btn { "Roland50" };
 
-    // Bottom Status & Telemetry Bar
+    // DAW Integration & Telemetry Controls
+    juce::TextButton testNoteBtn { "▶ Test Note C4" };
+    juce::TextButton pipewireLinkBtn { "⚡ Link Bitwig PipeWire" };
+    juce::ToggleButton muteOsToggle { "Mute OS Audio" };
+
     juce::Slider gainSlider;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment;
     juce::Label gainLabel;

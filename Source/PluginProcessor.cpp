@@ -3,10 +3,14 @@
 
 BrowserInstrumentAudioProcessor::BrowserInstrumentAudioProcessor()
     : AudioProcessor (BusesProperties()
-                        .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+                        .withInput  ("Audio In (Sampler)", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "Parameters", createParameterLayout())
 {
+    // Fix WebKitGTK EGL/DMABUF crashes on Linux NVIDIA drivers
+    setenv ("WEBKIT_FORCE_COMPOSITING_MODE", "1", 0);
+    setenv ("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
+
     outputGainParam = apvts.getRawParameterValue ("gain");
     bridgeEnabledParam = apvts.getRawParameterValue ("bridgeEnabled");
     sendInputParam = apvts.getRawParameterValue ("sendInput");
@@ -81,8 +85,9 @@ void BrowserInstrumentAudioProcessor::setCurrentProgram (int /*index*/) {}
 const juce::String BrowserInstrumentAudioProcessor::getProgramName (int /*index*/) { return {}; }
 void BrowserInstrumentAudioProcessor::changeProgramName (int /*index*/, const juce::String& /*newName*/) {}
 
-void BrowserInstrumentAudioProcessor::prepareToPlay (double /*sampleRate*/, int /*samplesPerBlock*/)
+void BrowserInstrumentAudioProcessor::prepareToPlay (double sampleRate, int /*samplesPerBlock*/)
 {
+    bridgeServer.setDawSampleRate ((int) sampleRate);
     bridgeServer.startServer();
 }
 
@@ -94,6 +99,11 @@ bool BrowserInstrumentAudioProcessor::isBusesLayoutSupported (const BusesLayout&
 {
     if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::mono()
      && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+
+    if (! layouts.getMainInputChannelSet().isDisabled()
+     && layouts.getMainInputChannelSet() != juce::AudioChannelSet::mono()
+     && layouts.getMainInputChannelSet() != juce::AudioChannelSet::stereo())
         return false;
 
     return true;
