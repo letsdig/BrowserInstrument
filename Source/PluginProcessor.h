@@ -3,6 +3,8 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "WebBridge/WebBridgeServer.h"
 
+class BrowserInstrumentAudioProcessorEditor;
+
 class BrowserInstrumentAudioProcessor : public juce::AudioProcessor
 {
 public:
@@ -42,6 +44,9 @@ public:
     juce::String getLastLoadedUrl() const { return currentUrl; }
     void setLastLoadedUrl(const juce::String& url) { currentUrl = url; }
 
+    void setEditor (BrowserInstrumentAudioProcessorEditor* ed) { activeEditor.store (ed); }
+    void pushBase64AudioFromBrowser (const juce::String& base64);
+
 private:
     WebBridge::WebBridgeServer bridgeServer;
     juce::AudioProcessorValueTreeState apvts;
@@ -50,6 +55,8 @@ private:
     std::atomic<float>* outputGainParam = nullptr;
     std::atomic<float>* bridgeEnabledParam = nullptr;
     std::atomic<float>* sendInputParam = nullptr;
+
+    std::atomic<BrowserInstrumentAudioProcessorEditor*> activeEditor { nullptr };
 
     juce::String currentUrl { "https://ypc2000.fun/" };
 

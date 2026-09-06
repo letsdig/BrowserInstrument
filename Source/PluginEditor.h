@@ -39,6 +39,8 @@ public:
     void resized() override;
     void timerCallback() override;
 
+    void sendMidiToBrowser (const juce::MidiMessage& msg);
+
 private:
     void navigateTo (const juce::String& url);
     void downloadCurrentPageOffline();
@@ -60,7 +62,8 @@ private:
     juce::ComboBox offlineCombo;
 
     // Preset Quick Links
-    juce::TextButton cardinalBtn { "Cardinal Modular" };
+    juce::TextButton synthAmeoBtn { "Ameo Synth" };
+    juce::TextButton cardinalBtn { "Cardinal" };
     juce::TextButton ypc2000Btn { "YPC-2000" };
     juce::TextButton acidMachineBtn { "AcidMachine" };
     juce::TextButton webSynthsBtn { "WebSynths" };

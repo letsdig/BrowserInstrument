@@ -54,9 +54,26 @@ public:
     }
 
     int getPort() const noexcept { return activePort.load(); }
-    bool isClientConnected() const noexcept { return clientConnected.load(); }
+    bool isClientConnected() const noexcept { return clientConnected.load() || nativeIpcActive.load(); }
     void setDawSampleRate(int rate) noexcept { dawSampleRate.store(rate); }
     int getDawSampleRate() const noexcept { return dawSampleRate.load(); }
+
+    void notifyNativeAudioReceived() noexcept
+    {
+        nativeIpcActive.store(true);
+        nativeIpcWatchdog.store(60);
+    }
+
+    void tickWatchdog() noexcept
+    {
+        int count = nativeIpcWatchdog.load();
+        if (count > 0)
+        {
+            nativeIpcWatchdog.store(count - 1);
+            if (count - 1 == 0)
+                nativeIpcActive.store(false);
+        }
+    }
 
     static juce::File getOfflineDirectory()
     {
@@ -224,6 +241,17 @@ public:
         sendWebSocketBinary(packet.data(), packet.size());
     }
 
+    // MIDI: Inject MIDI received from browser (called from WebSocket or Native IPC)
+    void injectMidiFromBrowser(int status, int d1, int d2)
+    {
+        juce::MidiMessage msg(static_cast<uint8_t>(status),
+                              static_cast<uint8_t>(d1),
+                              static_cast<uint8_t>(d2));
+        std::lock_guard<std::mutex> lock(midiMutex);
+        incomingMidi.push_back(msg);
+        midiInActivity.store(true);
+    }
+
     // MIDI: Read MIDI received from browser (called from processBlock)
     void getMidiFromBrowser(juce::MidiBuffer& destBuffer, int sampleOffset = 0)
     {
@@ -254,6 +282,48 @@ public:
         return midiOutActivity.exchange(false);
     }
 
+    void writeAudioToFifo(const float* interleavedData, int numChannels, int numSamples)
+    {
+        notifyNativeAudioReceived();
+
+        int freeSpace = audioFifo.getFreeSpace();
+        if (freeSpace < numSamples)
+        {
+            int toDiscard = numSamples - freeSpace;
+            audioFifo.finishedRead(toDiscard);
+        }
+
+        int start1, size1, start2, size2;
+        audioFifo.prepareToWrite(numSamples, start1, size1, start2, size2);
+
+        float maxPeak = 0.0f;
+
+        for (int i = 0; i < size1; ++i)
+        {
+            float s0 = interleavedData[i * numChannels + 0];
+            float s1 = numChannels > 1 ? interleavedData[i * numChannels + 1] : s0;
+            audioRingBuffer.setSample(0, start1 + i, s0);
+            audioRingBuffer.setSample(1, start1 + i, s1);
+            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
+        }
+
+        for (int i = 0; i < size2; ++i)
+        {
+            int srcIdx = (size1 + i) * numChannels;
+            float s0 = interleavedData[srcIdx + 0];
+            float s1 = numChannels > 1 ? interleavedData[srcIdx + 1] : s0;
+            audioRingBuffer.setSample(0, start2 + i, s0);
+            audioRingBuffer.setSample(1, start2 + i, s1);
+            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
+        }
+
+        audioFifo.finishedWrite(size1 + size2);
+
+        float currentPeak = peakAudioOut.load();
+        if (maxPeak > currentPeak)
+            peakAudioOut.store(maxPeak);
+    }
+
 private:
     class ClientWorkerThread : public juce::Thread
     {
@@ -269,7 +339,7 @@ private:
             signalThreadShouldExit();
             if (socket != nullptr)
                 socket->close();
-            stopThread(1500);
+            stopThread(1000);
         }
 
         void run() override
@@ -366,15 +436,16 @@ private:
         {
             if (handleWebSocketUpgrade(*sock, request))
             {
-                // Launch dedicated worker thread for this WebSocket client so listener never stalls!
-                std::lock_guard<std::mutex> lock(workerMutex);
-                activeWorker = std::make_unique<ClientWorkerThread>(*this, std::move(sock));
-                clientConnected.store(true);
+                stopActiveWorker();
+                {
+                    std::lock_guard<std::mutex> lock(workerMutex);
+                    activeWorker = std::make_unique<ClientWorkerThread>(*this, std::move(sock));
+                    clientConnected.store(true);
+                }
             }
         }
         else
         {
-            // Standard HTTP GET request for bridge script or offline localhost files!
             handleHttpStaticFile(*sock, request);
         }
     }
@@ -628,55 +699,8 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
         else if (packetType == 0x02 && size >= 4)
         {
             // MIDI from Browser: [0x02, status, data1, data2]
-            const uint8_t status = data[1];
-            const uint8_t d1 = data[2];
-            const uint8_t d2 = data[3];
-
-            juce::MidiMessage msg(status, d1, d2);
-            std::lock_guard<std::mutex> lock(midiMutex);
-            incomingMidi.push_back(msg);
-            midiInActivity.store(true);
+            injectMidiFromBrowser(data[1], data[2], data[3]);
         }
-    }
-
-    void writeAudioToFifo(const float* interleavedData, int numChannels, int numSamples)
-    {
-        int freeSpace = audioFifo.getFreeSpace();
-        if (freeSpace < numSamples)
-        {
-            int toDiscard = numSamples - freeSpace;
-            audioFifo.finishedRead(toDiscard);
-        }
-
-        int start1, size1, start2, size2;
-        audioFifo.prepareToWrite(numSamples, start1, size1, start2, size2);
-
-        float maxPeak = 0.0f;
-
-        for (int i = 0; i < size1; ++i)
-        {
-            float s0 = interleavedData[i * numChannels + 0];
-            float s1 = numChannels > 1 ? interleavedData[i * numChannels + 1] : s0;
-            audioRingBuffer.setSample(0, start1 + i, s0);
-            audioRingBuffer.setSample(1, start1 + i, s1);
-            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
-        }
-
-        for (int i = 0; i < size2; ++i)
-        {
-            int srcIdx = (size1 + i) * numChannels;
-            float s0 = interleavedData[srcIdx + 0];
-            float s1 = numChannels > 1 ? interleavedData[srcIdx + 1] : s0;
-            audioRingBuffer.setSample(0, start2 + i, s0);
-            audioRingBuffer.setSample(1, start2 + i, s1);
-            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
-        }
-
-        audioFifo.finishedWrite(size1 + size2);
-
-        float currentPeak = peakAudioOut.load();
-        if (maxPeak > currentPeak)
-            peakAudioOut.store(maxPeak);
     }
 
     void sendWebSocketBinary(const uint8_t* data, size_t size)
@@ -728,6 +752,8 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
     std::atomic<int> activePort { 8788 };
     std::atomic<int> dawSampleRate { 48000 };
     std::atomic<bool> clientConnected { false };
+    std::atomic<bool> nativeIpcActive { false };
+    std::atomic<int> nativeIpcWatchdog { 0 };
     std::atomic<bool> midiInActivity { false };
     std::atomic<bool> midiOutActivity { false };
     std::atomic<float> peakAudioOut { 0.0f };

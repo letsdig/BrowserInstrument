@@ -5,12 +5,33 @@
 BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (BrowserInstrumentAudioProcessor& p)
     : AudioProcessorEditor (&p), processorRef (p)
 {
-    // 1. Configure embedded browser options with injected user script and Chromium User-Agent
+    processorRef.setEditor (this);
+
+    // 1. Configure embedded browser options with injected user script, native event bridge, and Chromium User-Agent
     juce::WebBrowserComponent::Options options;
     options = options.withNativeIntegrationEnabled (true)
                      .withKeepPageLoadedWhenBrowserIsHidden()
                      .withUserAgent ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
-                     .withUserScript (WebBridge::getInjectionScript (processorRef.getBridgeServer().getPort()));
+                     .withUserScript (WebBridge::getInjectionScript (processorRef.getBridgeServer().getPort()))
+                     .withEventListener ("dawAudioData", [this] (const juce::var& data)
+                     {
+                         if (auto* obj = data.getDynamicObject())
+                         {
+                             auto b64 = obj->getProperty ("pcm").toString();
+                             if (b64.isNotEmpty())
+                                 processorRef.pushBase64AudioFromBrowser (b64);
+                         }
+                     })
+                     .withEventListener ("dawMidiData", [this] (const juce::var& data)
+                     {
+                         if (auto* obj = data.getDynamicObject())
+                         {
+                             int status = (int) obj->getProperty ("status");
+                             int d1 = (int) obj->getProperty ("d1");
+                             int d2 = (int) obj->getProperty ("d2");
+                             processorRef.getBridgeServer().injectMidiFromBrowser (status, d1, d2);
+                         }
+                     });
 
     browser = std::make_unique<InstrumentBrowserComponent> (
         options,
@@ -102,6 +123,7 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
         addAndMakeVisible (btn);
     };
 
+    setupPresetBtn (synthAmeoBtn, "https://synth.ameo.dev/");
     setupPresetBtn (cardinalBtn, "https://minicardinal.kx.studio/");
     setupPresetBtn (ypc2000Btn, "https://ypc2000.fun/");
     setupPresetBtn (acidMachineBtn, "https://acid-machine.com/");
@@ -133,14 +155,13 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     {
         juce::MidiMessage on = juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100);
         processorRef.getBridgeServer().sendMidiToBrowser (on);
-
-        if (browser)
-            browser->evaluateJavascript ("if (window.__JUCE_BRIDGE__) window.__JUCE_BRIDGE__.sendTestMidi(60, 100);");
+        sendMidiToBrowser (on);
 
         juce::Timer::callAfterDelay (200, [this]
         {
             juce::MidiMessage off = juce::MidiMessage::noteOff (1, 60, (juce::uint8) 0);
             processorRef.getBridgeServer().sendMidiToBrowser (off);
+            sendMidiToBrowser (off);
         });
     };
     addAndMakeVisible (testNoteBtn);
@@ -184,7 +205,29 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
 
 BrowserInstrumentAudioProcessorEditor::~BrowserInstrumentAudioProcessorEditor()
 {
+    processorRef.setEditor (nullptr);
     stopTimer();
+}
+
+void BrowserInstrumentAudioProcessorEditor::sendMidiToBrowser (const juce::MidiMessage& msg)
+{
+    if (browser == nullptr || msg.getRawDataSize() < 1)
+        return;
+
+    const auto* raw = msg.getRawData();
+    int status = raw[0];
+    int d1 = msg.getRawDataSize() > 1 ? raw[1] : 0;
+    int d2 = msg.getRawDataSize() > 2 ? raw[2] : 0;
+
+    juce::MessageManager::callAsync ([this, status, d1, d2]()
+    {
+        if (browser)
+        {
+            browser->evaluateJavascript (
+                "if (window.__JUCE_BRIDGE__) window.__JUCE_BRIDGE__.dispatchMidiFromDaw(" +
+                juce::String (status) + "," + juce::String (d1) + "," + juce::String (d2) + ");");
+        }
+    });
 }
 
 void BrowserInstrumentAudioProcessorEditor::navigateTo (const juce::String& url)
@@ -219,8 +262,8 @@ void BrowserInstrumentAudioProcessorEditor::openInSystemChrome()
     processorRef.getBridgeServer().ensureChromeExtensionCreated();
     auto extDir = WebBridge::WebBridgeServer::getChromeExtensionDirectory();
 
-    // Launch Chrome App Mode with auto-injected extension for full WebGL2 and WASM acceleration
-    juce::String cmd = chromeBin + " --load-extension=\"" + extDir.getFullPathName() + "\" --app=\"" + targetUrl + "\" &";
+    // Launch Chrome App Mode with auto-injected extension and flags to allow local WebSocket on HTTPS
+    juce::String cmd = chromeBin + " --allow-running-insecure-content --disable-web-security --load-extension=\"" + extDir.getFullPathName() + "\" --app=\"" + targetUrl + "\" &";
     int res = std::system (cmd.toRawUTF8());
     juce::ignoreUnused (res);
 
@@ -281,6 +324,7 @@ void BrowserInstrumentAudioProcessorEditor::refreshOfflinePresets()
 void BrowserInstrumentAudioProcessorEditor::timerCallback()
 {
     auto& bridge = processorRef.getBridgeServer();
+    bridge.tickWatchdog();
 
     isConnected = bridge.isClientConnected();
 
@@ -431,9 +475,11 @@ void BrowserInstrumentAudioProcessorEditor::resized()
 
     // Left-aligned Quick Presets in Row 2:
     int availPresetSpace = (w - rightControlsTotal - 16);
-    int presetW = juce::jlimit (75, 125, availPresetSpace / 5);
+    int presetW = juce::jlimit (65, 110, availPresetSpace / 6);
     int px = 8;
 
+    synthAmeoBtn.setBounds (px, r2Y, presetW - 4, r2H);
+    px += presetW;
     cardinalBtn.setBounds (px, r2Y, presetW - 4, r2H);
     px += presetW;
     ypc2000Btn.setBounds (px, r2Y, presetW - 4, r2H);
