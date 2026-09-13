@@ -22,13 +22,15 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WEBKIT_GTK REQUIRED IMPORTED_TARGET webkit2gtk-4.1 gtk+-3.0)
+pkg_check_modules(PULSE REQUIRED IMPORTED_TARGET libpulse-simple libpulse)
 
 juce_add_plugin(BrowserInstrument
     COMPANY_NAME "AudioWebLab"
-    IS_SYNTH TRUE
+    IS_SYNTH FALSE
     NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT TRUE
     IS_MIDI_EFFECT FALSE
+    VST3_CATEGORIES "Instrument" "Tools"
     PLUGIN_MANUFACTURER_CODE Awlb
     PLUGIN_CODE BrwI
     FORMATS VST3 Standalone
@@ -44,6 +46,8 @@ target_sources(BrowserInstrument
         Source/WebBridge/Sha1.h
         Source/WebBridge/BridgeScript.h
         Source/WebBridge/WebBridgeServer.h
+        Source/InstrumentBrowserComponent.h
+        Source/PulseCaptureThread.h
 )
 
 target_compile_definitions(BrowserInstrument
@@ -55,12 +59,12 @@ target_compile_definitions(BrowserInstrument
 target_link_libraries(BrowserInstrument
     PRIVATE
         PkgConfig::WEBKIT_GTK
+        PkgConfig::PULSE
         juce::juce_audio_utils
         juce::juce_audio_processors
         juce::juce_gui_extra
         juce::juce_core
     PUBLIC
         juce::juce_recommended_config_flags
-        juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
 )

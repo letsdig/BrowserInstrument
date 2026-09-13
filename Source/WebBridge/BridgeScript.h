@@ -5,10 +5,75 @@
 namespace WebBridge
 {
 
-inline juce::String getInjectionScript(int bridgePort = 8788)
+inline juce::String getInjectionScript(int bridgePort = 8788, int targetSampleRate = 48000, int bufferSize = 256)
 {
     return juce::String(R"JS(
 (function() {
+    // 0. Only run in top-level context. Never in iframes (e.g. YouTube embed player, about:blank)!
+    try {
+        if (typeof window === "undefined" || window.top !== window) {
+            return;
+        }
+    } catch (e) {
+        return;
+    }
+
+    // =========================================================================
+    // WEBKIT-GTK WEBAUDIO COMPATIBILITY FIXES FOR STRUDEL / SUPERDOUGH
+    // Fixes "Channel count cannot be 0" bug on Linux WebKitGTK where destination.maxChannelCount is 0
+    // =========================================================================
+    if (typeof AudioDestinationNode !== 'undefined') {
+        try {
+            Object.defineProperty(AudioDestinationNode.prototype, 'maxChannelCount', {
+                get: function() { return 2; },
+                set: function() {},
+                configurable: true
+            });
+            const origCc = Object.getOwnPropertyDescriptor(AudioNode.prototype, 'channelCount');
+            Object.defineProperty(AudioDestinationNode.prototype, 'channelCount', {
+                get: function() { return 2; },
+                set: function(val) {
+                    if (val < 1) val = 2;
+                    if (origCc && origCc.set) {
+                        try { origCc.set.call(this, val); } catch(e) {}
+                    }
+                },
+                configurable: true
+            });
+        } catch(e) {
+            console.warn("[JUCE-WebBridge] AudioDestinationNode patch warning:", e);
+        }
+    }
+
+    if (typeof ChannelMergerNode !== 'undefined') {
+        try {
+            const OrigMerger = window.ChannelMergerNode;
+            window.ChannelMergerNode = function(ctx, opts) {
+                let options = opts;
+                if (options && typeof options.numberOfInputs === 'number' && options.numberOfInputs < 1) {
+                    options = Object.assign({}, options, { numberOfInputs: 2 });
+                }
+                return new OrigMerger(ctx, options);
+            };
+            window.ChannelMergerNode.prototype = OrigMerger.prototype;
+        } catch(e) {}
+    }
+
+    try {
+        const desc = Object.getOwnPropertyDescriptor(AudioNode.prototype, 'channelCount');
+        if (desc && desc.set) {
+            const origSet = desc.set;
+            Object.defineProperty(AudioNode.prototype, 'channelCount', {
+                get: desc.get,
+                set: function(val) {
+                    if (typeof val === 'number' && val < 1) val = 2;
+                    return origSet.call(this, val);
+                },
+                configurable: true
+            });
+        }
+    } catch(e) {}
+
     if (window.__JUCE_BRIDGE_LOADED__) {
         console.log("[JUCE-WebBridge] Re-arming context scan...");
         if (typeof scanAndHook === "function") scanAndHook();
@@ -40,7 +105,9 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
     // Master configuration
     const CONFIG = {
         muteSystemAudio: true,
-        bufferSize: 512
+        bufferSize: %BUFFER_SIZE%,
+        targetSampleRate: %SAMPLE_RATE%,
+        transportPlaying: true
     };
 
     // =========================================================================
@@ -49,6 +116,10 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
     function sendNativeJuceEvent(eventId, payload) {
         try {
             const jsonStr = JSON.stringify({ eventId: eventId, payload: payload });
+            if (window.__JUCE__ && window.__JUCE__.backend && typeof window.__JUCE__.backend.emitEvent === "function") {
+                window.__JUCE__.backend.emitEvent(eventId, payload);
+                return true;
+            }
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.__JUCE__) {
                 window.webkit.messageHandlers.__JUCE__.postMessage(jsonStr);
                 return true;
@@ -67,7 +138,7 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
     sendNativeJuceEvent("bridgeStatus", { status: "connected", mode: "native" });
 
     // =========================================================================
-    // 1. WEBSOCKET CONNECTION (For External Chrome & Localhost)
+    // 1. WEBSOCKET CONNECTION (Sub-millisecond direct binary streaming)
     // =========================================================================
     function tryConnect() {
         if (wsConnected) return;
@@ -81,9 +152,11 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
                 if (!wsConnected && ws && ws.readyState !== WebSocket.OPEN) {
                     try { ws.close(); } catch(e) {}
                     portIndex++;
-                    tryConnect();
+                    if (portIndex < PORTS.length * 2) {
+                        tryConnect();
+                    }
                 }
-            }, 1200);
+            }, 1000);
 
             ws.onopen = function() {
                 clearTimeout(connectionTimeout);
@@ -244,7 +317,7 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
     function dispatchMidiFromDaw(status, d1, d2) {
         resumeAllContexts();
 
-        const bytes = new Uint8Array([status, d1, d2]);
+        const bytes = (status >= 0xF8) ? new Uint8Array([status]) : new Uint8Array([status, d1, d2]);
         const event = createMidiEvent(bytes);
 
         // 1. Direct callback invocation if set
@@ -324,104 +397,195 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
 
     // =========================================================================
     // 3. BULLETPROOF WEB AUDIO CAPTURE (Direct Native IPC + WebSocket)
+    //
+    // Uses an AudioWorkletNode (runs on the dedicated audio-rendering thread)
+    // instead of the legacy, main-thread ScriptProcessorNode. This removes the
+    // #1 cause of glitches/dropouts (main-thread jank stalling audio callbacks)
+    // and keeps audio flowing even while the WebView is hidden/backgrounded
+    // (e.g. when the plugin editor window is closed), since the audio thread
+    // is not subject to the same visibility throttling as the main thread.
+    // Falls back to ScriptProcessorNode only if AudioWorklet is unavailable.
     // =========================================================================
     const OrigAudioContext = window.AudioContext || window.webkitAudioContext;
     const origConnect = (typeof AudioNode !== "undefined" && AudioNode.prototype) ? AudioNode.prototype.connect : null;
 
-    function hookContext(ctx) {
+    const CAPTURE_WORKLET_SRC = [
+        "class JuceCaptureProcessor extends AudioWorkletProcessor {",
+        "  process(inputs, outputs) {",
+        "    const input = inputs[0];",
+        "    const inL = (input && input[0]) ? input[0] : new Float32Array(128);",
+        "    const inR = (input && input.length > 1 && input[1]) ? input[1] : inL;",
+        "    const len = inL.length;",
+        "    const packet = new Float32Array(len * 2);",
+        "    for (let i = 0; i < len; i++) {",
+        "      packet[i * 2] = inL[i];",
+        "      packet[i * 2 + 1] = inR[i];",
+        "    }",
+        "    this.port.postMessage({ sr: sampleRate, len: len, pcm: packet.buffer }, [packet.buffer]);",
+        "    return true;", // Do NOT copy to outputs; keep downstream 100% silent to OS speakers
+        "  }",
+        "}",
+        "registerProcessor('juce-capture-processor', JuceCaptureProcessor);"
+    ].join("\n");
+    let captureWorkletUrl = null;
+    const nativeIpcAccumulator = [];
+
+    // Shared by both the AudioWorklet path and the ScriptProcessor fallback.
+    function handleCapturedBlock(currentRate, len, pcmBuffer) {
+        // 1. FAST PATH: Direct Binary WebSocket Transmission (Zero GC, zero base64 overhead)
+        if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
+            const headerSize = 8;
+            const packet = new Uint8Array(headerSize + len * 2 * 4);
+            packet[0] = 0x01; // Audio Output
+            packet[1] = 0x02; // 2 channels
+            packet[2] = len & 0xFF;
+            packet[3] = (len >> 8) & 0xFF;
+
+            const rateInt = Math.round(currentRate);
+            packet[4] = rateInt & 0xFF;
+            packet[5] = (rateInt >> 8) & 0xFF;
+            packet[6] = (rateInt >> 16) & 0xFF;
+            packet[7] = (rateInt >> 24) & 0xFF;
+
+            new Float32Array(packet.buffer, headerSize, len * 2).set(new Float32Array(pcmBuffer));
+
+            try {
+                ws.send(packet.buffer);
+            } catch (err) {}
+        }
+        else {
+            // In embedded VST3, all audio is captured at 0% CPU with sample-accuracy directly via PulseAudio / PipeWire.
+            // Native IPC Base64 is disabled to prevent dual-stream collision and distortion.
+        }
+    }
+
+    function getOrCreateJuceAudioContext() {
+        if (!window.__juceAudioCtx) {
+            try {
+                const opts = (CONFIG.targetSampleRate > 0) ? { sampleRate: CONFIG.targetSampleRate } : {};
+                const c = new OrigAudioContext(opts);
+                hookContext(c);
+            } catch(e) {
+                try {
+                    const c = new OrigAudioContext();
+                    hookContext(c);
+                } catch(e2) {
+                    console.warn("[JUCE-WebBridge] Error initializing default AudioContext:", e2);
+                }
+            }
+        }
+        return window.__juceAudioCtx;
+    }
+
+    async function hookContext(ctx) {
         if (!ctx || ctx.__juceHooked) return;
         ctx.__juceHooked = true;
         allHookedContexts.add(ctx);
         window.__juceAudioCtx = ctx;
 
         try {
-            const masterTap = ctx.createGain();
-            masterTap.gain.value = 1.0;
-            ctx.__juceMasterTap = masterTap;
-
-            const proc = ctx.createScriptProcessor(CONFIG.bufferSize, 2, 2);
-            ctx.__juceProc = proc;
-
-            const silentSink = ctx.createGain();
-            // Imperceptible non-zero gain when muted so browser never treats as dead branch
-            silentSink.gain.value = CONFIG.muteSystemAudio ? 0.00001 : 1.0;
-            ctx.__juceSilentSink = silentSink;
-
-            // Direct native connection to destination (bypassing custom connect hook)
-            if (origConnect) {
-                origConnect.call(masterTap, proc);
-                origConnect.call(proc, silentSink);
-                try {
-                    origConnect.call(silentSink, ctx.destination);
-                } catch(e) {}
+            if (ctx.destination) {
+                try { ctx.destination.channelCount = 2; } catch(e) {}
             }
 
-            proc.onaudioprocess = function(e) {
-                const inL = e.inputBuffer.getChannelData(0);
-                const inR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : inL;
-                const len = inL.length;
+            const masterTap = ctx.createGain();
+            masterTap.gain.value = 1.0;
+            try { masterTap.channelCount = 2; } catch(e) {}
+            ctx.__juceMasterTap = masterTap;
 
-                // When OS audio is unmuted, pass audio through to destination
-                if (!CONFIG.muteSystemAudio) {
+            let node = null;
+
+            // Preferred path: AudioWorkletNode
+            if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === "function") {
+                try {
+                    if (!captureWorkletUrl) {
+                        const blob = new Blob([CAPTURE_WORKLET_SRC], { type: "application/javascript" });
+                        captureWorkletUrl = URL.createObjectURL(blob);
+                    }
+                    await ctx.audioWorklet.addModule(captureWorkletUrl);
+                    node = new AudioWorkletNode(ctx, "juce-capture-processor", {
+                        numberOfInputs: 1,
+                        numberOfOutputs: 1,
+                        channelCount: 2,
+                        channelCountMode: "explicit",
+                        channelInterpretation: "discrete",
+                        outputChannelCount: [2]
+                    });
+                    node.port.onmessage = (e) => {
+                        handleCapturedBlock(e.data.sr, e.data.len, e.data.pcm);
+                    };
+                } catch (err) {
+                    console.warn("[JUCE-WebBridge] AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+                    node = null;
+                }
+            }
+
+            // Fallback: legacy ScriptProcessorNode (main-thread; only used on
+            // engines without AudioWorklet support)
+            if (!node) {
+                const proc = ctx.createScriptProcessor(CONFIG.bufferSize, 2, 2);
+                try { proc.channelCount = 2; } catch(e) {}
+                proc.onaudioprocess = function(e) {
+                    const inL = e.inputBuffer.getChannelData(0);
+                    const inR = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : inL;
+                    const len = inL.length;
+                    const currentRate = (this.context && this.context.sampleRate) ? this.context.sampleRate : (CONFIG.targetSampleRate || 48000);
+
+                    // Silence output buffer so zero audio leaks to host/speakers
                     const outL = e.outputBuffer.getChannelData(0);
                     const outR = e.outputBuffer.numberOfChannels > 1 ? e.outputBuffer.getChannelData(1) : outL;
-                    outL.set(inL);
-                    if (outR !== outL) outR.set(inR);
-                }
+                    outL.fill(0);
+                    if (outR !== outL) outR.fill(0);
 
-                // 1. Direct Native In-Memory IPC to JUCE (100% immune to Mixed Content / CORS)
-                const f32 = new Float32Array(len * 2);
-                for (let i = 0; i < len; i++) {
-                    f32[i * 2 + 0] = inL[i];
-                    f32[i * 2 + 1] = inR[i];
-                }
-                const u8 = new Uint8Array(f32.buffer);
-                let bin = "";
-                const chunkSz = 1024;
-                for (let i = 0; i < u8.length; i += chunkSz) {
-                    bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunkSz));
-                }
-                const b64 = btoa(bin);
-
-                sendNativeJuceEvent("dawAudioData", { pcm: b64, channels: 2, samples: len });
-
-                // 2. WebSocket transmission (for external Google Chrome)
-                if (wsConnected && ws && ws.readyState === WebSocket.OPEN) {
-                    const packet = new Uint8Array(4 + len * 2 * 4);
-                    packet[0] = 0x01; // Audio Output
-                    packet[1] = 0x02; // 2 channels
-                    packet[2] = len & 0xFF;
-                    packet[3] = (len >> 8) & 0xFF;
-
-                    const packetF32 = new Float32Array(packet.buffer, 4, len * 2);
+                    const f32 = new Float32Array(len * 2);
                     for (let i = 0; i < len; i++) {
-                        packetF32[i * 2 + 0] = inL[i];
-                        packetF32[i * 2 + 1] = inR[i];
+                        f32[i * 2 + 0] = inL[i];
+                        f32[i * 2 + 1] = inR[i];
                     }
+                    handleCapturedBlock(currentRate, len, f32.buffer);
+                };
+                node = proc;
+            }
 
+            ctx.__juceProc = node;
+
+            // Connect masterTap to capture node, and connect capture node to silent sink then to ctx.destination.
+            // This actively drives the WebKitGTK audio rendering pipeline while keeping OS speakers 100% silent!
+            if (origConnect) {
+                origConnect.call(masterTap, node);
+                try {
+                    const silentSink = ctx.createGain();
+                    silentSink.gain.value = 0.0;
+                    ctx.__juceSilentSink = silentSink;
+                    origConnect.call(node, silentSink);
+                    origConnect.call(silentSink, ctx.destination);
+                } catch(e) {
                     try {
-                        ws.send(packet.buffer);
-                    } catch (err) {}
+                        const dummyDest = ctx.createMediaStreamDestination();
+                        origConnect.call(node, dummyDest);
+                    } catch(e2) {}
                 }
-            };
+            }
 
-            console.log("[JUCE-WebBridge] AudioContext hooked successfully for Bitwig VST3!");
+            console.log("[JUCE-WebBridge] AudioContext hooked successfully (" + (node.port ? "AudioWorklet" : "ScriptProcessor") + ") for Bitwig VST3!");
         } catch (err) {
             console.error("[JUCE-WebBridge] Error hooking AudioContext:", err);
         }
     }
 
     function updateMuteState() {
-        for (const ctx of allHookedContexts) {
-            if (ctx && ctx.__juceSilentSink) {
-                ctx.__juceSilentSink.gain.value = CONFIG.muteSystemAudio ? 0.00001 : 1.0;
-            }
-        }
+        // Kept for backward compatibility
     }
 
     if (OrigAudioContext) {
         window.AudioContext = class extends OrigAudioContext {
             constructor(...args) {
+                let opts = args[0] || {};
+                if (typeof opts !== 'object') opts = {};
+                if (CONFIG.targetSampleRate > 0 && !opts.sampleRate) {
+                    opts = Object.assign({}, opts, { sampleRate: CONFIG.targetSampleRate });
+                    args[0] = opts;
+                }
                 super(...args);
                 hookContext(this);
             }
@@ -445,14 +609,11 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
                         hookContext(this.context);
                         const tap = this.context.__juceMasterTap;
 
-                        // If connecting to native destination: redirect to master tap!
+                        // If connecting to native destination: redirect strictly to master tap!
+                        // This guarantees 0% audio ever reaches ctx.destination unintercepted!
                         if (tap && (destination === this.context.destination || 
                                     (typeof AudioDestinationNode !== "undefined" && destination instanceof AudioDestinationNode))) {
                             origConnect.call(this, tap, outputIndex || 0, inputIndex || 0);
-
-                            if (!CONFIG.muteSystemAudio) {
-                                return origConnect.call(this, destination, outputIndex || 0, inputIndex || 0);
-                            }
                             return destination;
                         }
                     }
@@ -465,26 +626,11 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
     }
 
     // =========================================================================
-    // 4. HTML5 MEDIA ELEMENT CAPTURE (<audio>, <video>, YouTube in YPC2000)
+    // 4. HTML5 MEDIA / YOUTUBE VIDEO STREAMING
+    // Handled natively by WebKitGTK & GStreamer via BrowserInstrumentSink.
+    // Captured with ultra-low latency by PulseAudioCaptureThread in C++.
+    // JavaScript does NOT tamper with <video>, <audio>, or YouTube players.
     // =========================================================================
-    if (typeof HTMLMediaElement !== "undefined") {
-        const origPlay = HTMLMediaElement.prototype.play;
-        HTMLMediaElement.prototype.play = function() {
-            try {
-                if (!this.__juceMediaTapped && window.__juceAudioCtx && window.__juceAudioCtx.__juceMasterTap) {
-                    this.__juceMediaTapped = true;
-                    try {
-                        const source = window.__juceAudioCtx.createMediaElementSource(this);
-                        source.connect(window.__juceAudioCtx.__juceMasterTap);
-                        if (CONFIG.muteSystemAudio) {
-                            this.muted = false; // keep element playing internally
-                        }
-                    } catch (err) {}
-                }
-            } catch(e) {}
-            return origPlay.apply(this, arguments);
-        };
-    }
 
     // =========================================================================
     // 5. GETUSERMEDIA SHIM (Sample directly from Bitwig Track Audio)
@@ -496,8 +642,7 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
         navigator.mediaDevices.getUserMedia = async function(constraints) {
             if (constraints && (constraints.audio || constraints.audio === true)) {
                 console.log("[JUCE-WebBridge] getUserMedia({ audio }) intercepted! Streaming Bitwig track audio into sampler...");
-                const ctx = window.__juceAudioCtx || new OrigAudioContext();
-                hookContext(ctx);
+                const ctx = getOrCreateJuceAudioContext();
 
                 const streamDest = ctx.createMediaStreamDestination();
                 const feedProc = ctx.createScriptProcessor(CONFIG.bufferSize, 0, 2);
@@ -540,10 +685,22 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
         }
     }
 
-    scanAndHook();
+    function scanAndHookAll() {
+        scanAndHook();
+    }
+
+    scanAndHookAll();
+    getOrCreateJuceAudioContext();
+
     if (typeof window !== "undefined") {
-        window.addEventListener("DOMContentLoaded", scanAndHook);
-        window.addEventListener("load", scanAndHook);
+        ['pointerdown', 'mousedown', 'mouseup', 'keydown', 'keyup', 'touchstart', 'touchend', 'click'].forEach(evt => {
+            window.addEventListener(evt, () => {
+                resumeAllContexts();
+                scanAndHookAll();
+            }, { passive: true });
+        });
+        window.addEventListener("DOMContentLoaded", scanAndHookAll);
+        window.addEventListener("load", scanAndHookAll);
     }
 
     // Global controller
@@ -555,6 +712,81 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
             updateMuteState();
         },
         dispatchMidiFromDaw: dispatchMidiFromDaw,
+        setTransportPlay: function(play) {
+            try {
+                if (play) {
+                    CONFIG.transportPlaying = true;
+                    resumeAllContexts();
+                    if (window.strudelMirror) {
+                        try {
+                            if (typeof window.strudelMirror.evaluate === 'function') {
+                                window.strudelMirror.evaluate();
+                                return;
+                            }
+                            if (window.strudelMirror.repl && typeof window.strudelMirror.repl.evaluate === 'function') {
+                                window.strudelMirror.repl.evaluate(window.strudelMirror.code);
+                                return;
+                            }
+                        } catch(e) {}
+                    }
+                    const playBtns = document.querySelectorAll('button[title="play"], button[title*="play" i], button[aria-label*="play" i]');
+                    playBtns.forEach(btn => btn.click());
+                } else {
+                    CONFIG.transportPlaying = false;
+                    let stoppedNatively = false;
+                    if (window.strudelMirror) {
+                        try {
+                            if (window.strudelMirror.repl) {
+                                if (window.strudelMirror.repl.scheduler) {
+                                    window.strudelMirror.repl.scheduler.stop();
+                                    stoppedNatively = true;
+                                }
+                                if (typeof window.strudelMirror.repl.stop === 'function') {
+                                    window.strudelMirror.repl.stop();
+                                    stoppedNatively = true;
+                                }
+                            }
+                            if (typeof window.strudelMirror.stop === 'function') {
+                                window.strudelMirror.stop();
+                                stoppedNatively = true;
+                            }
+                        } catch(e) {}
+                        try {
+                            const ed = window.strudelMirror.editor;
+                            document.dispatchEvent(new CustomEvent('repl-stop', { detail: { view: ed } }));
+                            window.dispatchEvent(new CustomEvent('repl-stop', { detail: { view: ed } }));
+                        } catch(e) {}
+                    }
+                    try {
+                        if (typeof window.hush === 'function') window.hush();
+                        if (typeof hush === 'function') hush();
+                    } catch(e) {}
+
+                    // IMPORTANT: only fall back to clicking a DOM "stop" button when the
+                    // native scheduler API was not available. Some Strudel UI builds use a
+                    // single toggle button for play/stop; clicking it *after* the transport
+                    // has already been stopped natively can flip it back to "play" and
+                    // restart audio right after the DAW stops (the bug where playback
+                    // seems to click "stop" and immediately keep going).
+                    if (!stoppedNatively) {
+                        try {
+                            const stopBtns = document.querySelectorAll('button[title="stop"], button[title*="stop" i], button[aria-label*="stop" i]');
+                            stopBtns.forEach(btn => btn.click());
+                            document.dispatchEvent(new CustomEvent('stop-repl'));
+                        } catch(e) {}
+                    }
+                }
+            } catch(e) {
+                console.warn("[JUCE-WebBridge] setTransportPlay error:", e);
+            }
+        },
+        setBpm: function(bpm) {
+            try {
+                if (typeof window.setcps === 'function') {
+                    window.setcps(bpm / 240.0);
+                }
+            } catch(e) {}
+        },
         sendTestMidi: (note = 60, vel = 100) => {
             dispatchMidiFromDaw(0x90, note, vel);
             setTimeout(() => dispatchMidiFromDaw(0x80, note, 0), 250);
@@ -564,7 +796,10 @@ inline juce::String getInjectionScript(int bridgePort = 8788)
 
     console.log("[JUCE-WebBridge] All hooks active: Bitwig Track Audio & MIDI Ready!");
 })();
-)JS").replace("%PORT%", juce::String(bridgePort));
+)JS")
+        .replace("%PORT%", juce::String(bridgePort))
+        .replace("%SAMPLE_RATE%", juce::String(targetSampleRate))
+        .replace("%BUFFER_SIZE%", juce::String(bufferSize));
 }
 
 } // namespace WebBridge

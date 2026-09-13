@@ -2,6 +2,8 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "WebBridge/WebBridgeServer.h"
+#include "InstrumentBrowserComponent.h"
+#include "PulseCaptureThread.h"
 
 class BrowserInstrumentAudioProcessorEditor;
 
@@ -42,13 +44,40 @@ public:
     juce::AudioProcessorValueTreeState& getAPVTS() noexcept { return apvts; }
 
     juce::String getLastLoadedUrl() const { return currentUrl; }
-    void setLastLoadedUrl(const juce::String& url) { currentUrl = url; }
+    void setLastLoadedUrl (const juce::String& url) { currentUrl = url; }
 
     void setEditor (BrowserInstrumentAudioProcessorEditor* ed) { activeEditor.store (ed); }
-    void pushBase64AudioFromBrowser (const juce::String& base64);
+    void pushBase64AudioFromBrowser (const juce::String& /*base64*/, double /*sourceSampleRate*/ = 0.0) {}
+
+    bool isDawPlaying() const noexcept { return wasDawPlaying.load(); }
+    double getDawBpm() const noexcept { return lastDawBpm.load(); }
+
+    void setPreferredSampleRate (int rate) noexcept { preferredSampleRate.store (rate); }
+    int getPreferredSampleRate() const noexcept { return preferredSampleRate.load(); }
+    int getEffectiveSampleRate() const noexcept
+    {
+        int p = preferredSampleRate.load();
+        return p > 0 ? p : (bridgeServer.getDawSampleRate() > 0 ? bridgeServer.getDawSampleRate() : 48000);
+    }
+
+    InstrumentBrowserComponent* getOrCreateBrowser();
+    InstrumentBrowserComponent* getBrowser() const noexcept { return browser.get(); }
+    void createPersistentBrowser();
+
+    void reattachBrowserToHiddenHost();
+    juce::Component* getHiddenHost() const noexcept { return hiddenHost.get(); }
 
 private:
+    struct HiddenBrowserHost : public juce::Component
+    {
+        HiddenBrowserHost() { setOpaque (false); }
+    };
+
     WebBridge::WebBridgeServer bridgeServer;
+    std::unique_ptr<PulseAudioCaptureThread> pulseCaptureThread;
+    std::unique_ptr<InstrumentBrowserComponent> browser;
+    std::unique_ptr<HiddenBrowserHost> hiddenHost;
+
     juce::AudioProcessorValueTreeState apvts;
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -57,6 +86,9 @@ private:
     std::atomic<float>* sendInputParam = nullptr;
 
     std::atomic<BrowserInstrumentAudioProcessorEditor*> activeEditor { nullptr };
+    std::atomic<bool> wasDawPlaying { false };
+    std::atomic<double> lastDawBpm { 120.0 };
+    std::atomic<int> preferredSampleRate { 0 };
 
     juce::String currentUrl { "https://ypc2000.fun/" };
 

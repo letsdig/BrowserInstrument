@@ -1,99 +1,94 @@
 #pragma once
 
-#include <juce_core/juce_core.h>
-#include <juce_audio_basics/juce_audio_basics.h>
-#include "Sha1.h"
 #include "BridgeScript.h"
+#include "Sha1.h"
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_core/juce_core.h>
 
 #include <atomic>
-#include <vector>
-#include <mutex>
 #include <memory>
+#include <mutex>
+#include <vector>
 
-namespace WebBridge
-{
+namespace WebBridge {
 
-class WebBridgeServer : public juce::Thread
-{
+class WebBridgeServer : public juce::Thread {
 public:
-    explicit WebBridgeServer(int preferredPort = 8788)
-        : juce::Thread("WebBridgeServerThread"),
-          activePort(preferredPort),
-          audioFifo(ringBufferSize),
-          audioRingBuffer(2, ringBufferSize)
-    {
-        audioRingBuffer.clear();
-        getOfflineDirectory().createDirectory();
+  explicit WebBridgeServer(int preferredPort = 8788)
+      : juce::Thread("WebBridgeServerThread"), activePort(preferredPort),
+        audioFifo(ringBufferSize), audioRingBuffer(2, ringBufferSize) {
+    audioRingBuffer.clear();
+    getOfflineDirectory().createDirectory();
+  }
+
+  ~WebBridgeServer() override { stopServer(); }
+
+  void startServer() {
+    if (isThreadRunning())
+      return;
+
+    shouldStop = false;
+    startThread(juce::Thread::Priority::high);
+  }
+
+  void stopServer() {
+    shouldStop = true;
+    signalThreadShouldExit();
+
+    stopActiveWorker();
+
+    if (serverSocket != nullptr)
+      serverSocket->close();
+
+    stopThread(2000);
+  }
+
+  int getPort() const noexcept { return activePort.load(); }
+  bool isClientConnected() const noexcept {
+    return clientConnected.load() || nativeIpcActive.load();
+  }
+  void setDawSampleRate(int rate) noexcept { dawSampleRate.store(rate); }
+  int getDawSampleRate() const noexcept { return dawSampleRate.load(); }
+
+  void notifyNativeAudioReceived() noexcept {
+    nativeIpcActive.store(true);
+    nativeIpcWatchdog.store(60);
+  }
+
+  void tickWatchdog() noexcept {
+    int count = nativeIpcWatchdog.load();
+    if (count > 0) {
+      nativeIpcWatchdog.store(count - 1);
+      if (count - 1 == 0)
+        nativeIpcActive.store(false);
     }
 
-    ~WebBridgeServer() override
-    {
-        stopServer();
-    }
+    std::lock_guard<std::mutex> lock(workerMutex);
+    activeWorkers.erase(
+        std::remove_if(activeWorkers.begin(), activeWorkers.end(),
+                       [](const std::unique_ptr<ClientWorkerThread> &w) {
+                         return w == nullptr || !w->isThreadRunning();
+                       }),
+        activeWorkers.end());
+    clientConnected.store(!activeWorkers.empty());
+  }
 
-    void startServer()
-    {
-        if (isThreadRunning())
-            return;
+  static juce::File getOfflineDirectory() {
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile(".local/share/BrowserInstrument/offline");
+  }
 
-        shouldStop = false;
-        startThread(juce::Thread::Priority::high);
-    }
+  static juce::File getChromeExtensionDirectory() {
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile(".local/share/BrowserInstrument/chrome_extension");
+  }
 
-    void stopServer()
-    {
-        shouldStop = true;
-        signalThreadShouldExit();
+  void ensureChromeExtensionCreated() {
+    auto extDir = getChromeExtensionDirectory();
+    extDir.createDirectory();
 
-        stopActiveWorker();
-
-        if (serverSocket != nullptr)
-            serverSocket->close();
-
-        stopThread(2000);
-    }
-
-    int getPort() const noexcept { return activePort.load(); }
-    bool isClientConnected() const noexcept { return clientConnected.load() || nativeIpcActive.load(); }
-    void setDawSampleRate(int rate) noexcept { dawSampleRate.store(rate); }
-    int getDawSampleRate() const noexcept { return dawSampleRate.load(); }
-
-    void notifyNativeAudioReceived() noexcept
-    {
-        nativeIpcActive.store(true);
-        nativeIpcWatchdog.store(60);
-    }
-
-    void tickWatchdog() noexcept
-    {
-        int count = nativeIpcWatchdog.load();
-        if (count > 0)
-        {
-            nativeIpcWatchdog.store(count - 1);
-            if (count - 1 == 0)
-                nativeIpcActive.store(false);
-        }
-    }
-
-    static juce::File getOfflineDirectory()
-    {
-        return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
-                   .getChildFile(".local/share/BrowserInstrument/offline");
-    }
-
-    static juce::File getChromeExtensionDirectory()
-    {
-        return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
-                   .getChildFile(".local/share/BrowserInstrument/chrome_extension");
-    }
-
-    void ensureChromeExtensionCreated()
-    {
-        auto extDir = getChromeExtensionDirectory();
-        extDir.createDirectory();
-
-        auto manifestFile = extDir.getChildFile("manifest.json");
-        juce::String manifest = R"JSON({
+    auto manifestFile = extDir.getChildFile("manifest.json");
+    juce::String manifest = R"JSON({
   "manifest_version": 3,
   "name": "BrowserInstrument DAW Bridge",
   "version": "1.0",
@@ -109,401 +104,514 @@ public:
     }
   ]
 })JSON";
-        manifestFile.replaceWithText(manifest);
+    manifestFile.replaceWithText(manifest);
 
-        auto bridgeJsFile = extDir.getChildFile("bridge.js");
-        bridgeJsFile.replaceWithText(getInjectionScript(activePort.load()));
+    auto bridgeJsFile = extDir.getChildFile("bridge.js");
+    bridgeJsFile.replaceWithText(getInjectionScript(activePort.load()));
+  }
+
+  juce::StringArray getOfflinePresets() {
+    juce::StringArray presets;
+    auto dir = getOfflineDirectory();
+    if (dir.isDirectory()) {
+      auto subdirs = dir.findChildFiles(juce::File::findDirectories, false);
+      for (const auto &d : subdirs) {
+        presets.add(d.getFileName());
+      }
+    }
+    return presets;
+  }
+
+  void setJitterCushionSamples(int samples) noexcept {
+    jitterCushionSamples.store(juce::jlimit(0, 8192, samples));
+  }
+  int getJitterCushionSamples() const noexcept {
+    return jitterCushionSamples.load();
+  }
+
+  void setJitterCushionMs(int ms) noexcept {
+    int rate = dawSampleRate.load();
+    if (rate <= 0)
+      rate = 48000;
+    setJitterCushionSamples(ms * rate / 1000);
+  }
+  int getJitterCushionMs() const noexcept {
+    int rate = dawSampleRate.load();
+    if (rate <= 0)
+      rate = 48000;
+    return jitterCushionSamples.load() * 1000 / rate;
+  }
+
+  void setOutputGain(float gain) noexcept { outputGain.store(gain); }
+  float getOutputGain() const noexcept { return outputGain.load(); }
+
+  void flushAudioBuffer() {
+    audioFifo.reset();
+    audioRingBuffer.clear();
+    isBuffering.store(true);
+    needsFadeIn.store(true);
+  }
+
+  // Audio Output: Read audio generated by browser (called from processBlock)
+  int readAudioFromBrowser(float *const *destinationChannels, int numChannels,
+                           int numSamples) {
+    const int cushion = jitterCushionSamples.load();
+    const float gain = outputGain.load();
+
+    int available = audioFifo.getNumReady();
+
+    // Real-Time Catch-up:
+    // If the DAW was paused/stopped and restarted, or if FIFO accumulated more
+    // than cushion + 2 blocks, instantly discard the old buffered audio so
+    // Bitwig immediately plays the latest real-time audio!
+    const int maxLead = juce::jmax(cushion + numSamples, numSamples * 2);
+    if (available > maxLead) {
+      int stale = available - maxLead;
+      audioFifo.finishedRead(stale);
+      available = maxLead;
     }
 
-    juce::StringArray getOfflinePresets()
-    {
-        juce::StringArray presets;
-        auto dir = getOfflineDirectory();
-        if (dir.isDirectory())
-        {
-            auto subdirs = dir.findChildFiles(juce::File::findDirectories, false);
-            for (const auto& d : subdirs)
-            {
-                presets.add(d.getFileName());
-            }
-        }
-        return presets;
-    }
-
-    static void pipewireLinkToBitwig()
-    {
-        juce::Thread::launch([]()
-        {
-            // 1. Link browser audio to Bitwig Studio in_stereo_1 (if Bitwig input ports exist)
-            int r1 = std::system("for port in $(pw-link -o 2>/dev/null | grep -E -i '(Chromium|WebKit|chrome)'); do "
-                                 "  bitwig_l=$(pw-link -i 2>/dev/null | grep -E -i 'Bitwig.*(in_stereo_1_l|input_1|in_1|capture_FL)' | head -n 1); "
-                                 "  bitwig_r=$(pw-link -i 2>/dev/null | grep -E -i 'Bitwig.*(in_stereo_1_r|input_2|in_2|capture_FR)' | head -n 1); "
-                                 "  if [ -n \"$bitwig_l\" ] && echo \"$port\" | grep -q '_FL'; then pw-link \"$port\" \"$bitwig_l\" 2>/dev/null; fi; "
-                                 "  if [ -n \"$bitwig_r\" ] && echo \"$port\" | grep -q '_FR'; then pw-link \"$port\" \"$bitwig_r\" 2>/dev/null; fi; "
-                                 "done");
-            juce::ignoreUnused(r1);
-
-            // 2. Unlink browser audio from physical speakers so it doesn't duplicate
-            int r2 = std::system("for port in $(pw-link -o 2>/dev/null | grep -E -i '(Chromium|WebKit|chrome)'); do "
-                                 "  for spk in $(pw-link -i 2>/dev/null | grep -E 'alsa_output.*playback_F'); do "
-                                 "    pw-link -d \"$port\" \"$spk\" 2>/dev/null; "
-                                 "  done; "
-                                 "done");
-            juce::ignoreUnused(r2);
-        });
-    }
-
-    // Audio Output: Read audio generated by browser (called from processBlock)
-    int readAudioFromBrowser(float* const* destinationChannels, int numChannels, int numSamples)
-    {
-        int available = audioFifo.getNumReady();
-        int samplesToRead = juce::jmin(available, numSamples);
-
-        if (samplesToRead <= 0)
-        {
-            for (int ch = 0; ch < numChannels; ++ch)
-                juce::FloatVectorOperations::clear(destinationChannels[ch], numSamples);
-            return 0;
-        }
-
-        int start1, size1, start2, size2;
-        audioFifo.prepareToRead(samplesToRead, start1, size1, start2, size2);
-
+    // 1. Initial / underrun cushion buffering to eliminate jitter
+    if (isBuffering.load()) {
+      if (available >= cushion) {
+        isBuffering.store(false);
+        needsFadeIn.store(true);
+      } else {
         for (int ch = 0; ch < numChannels; ++ch)
-        {
-            const int sourceCh = juce::jmin(ch, audioRingBuffer.getNumChannels() - 1);
-            if (size1 > 0)
-                juce::FloatVectorOperations::copy(destinationChannels[ch],
-                                                   audioRingBuffer.getReadPointer(sourceCh, start1),
-                                                   size1);
-            if (size2 > 0)
-                juce::FloatVectorOperations::copy(destinationChannels[ch] + size1,
-                                                   audioRingBuffer.getReadPointer(sourceCh, start2),
-                                                   size2);
+          juce::FloatVectorOperations::clear(destinationChannels[ch],
+                                             numSamples);
+        return 0;
+      }
+    }
 
-            if (samplesToRead < numSamples)
-            {
-                juce::FloatVectorOperations::clear(destinationChannels[ch] + samplesToRead,
-                                                   numSamples - samplesToRead);
+    // 2. Prevent stuttering partial blocks: if ready samples are less than a
+    // full DAW block, re-buffer!
+    if (available < numSamples) {
+      isBuffering.store(true);
+      for (int ch = 0; ch < numChannels; ++ch)
+        juce::FloatVectorOperations::clear(destinationChannels[ch], numSamples);
+      return 0;
+    }
+
+    int start1, size1, start2, size2;
+    audioFifo.prepareToRead(numSamples, start1, size1, start2, size2);
+
+    for (int ch = 0; ch < numChannels; ++ch) {
+      const int sourceCh = juce::jmin(ch, audioRingBuffer.getNumChannels() - 1);
+      if (size1 > 0)
+        juce::FloatVectorOperations::copy(
+            destinationChannels[ch],
+            audioRingBuffer.getReadPointer(sourceCh, start1), size1);
+      if (size2 > 0)
+        juce::FloatVectorOperations::copy(
+            destinationChannels[ch] + size1,
+            audioRingBuffer.getReadPointer(sourceCh, start2), size2);
+
+      if (std::abs(gain - 1.0f) > 0.001f) {
+        juce::FloatVectorOperations::multiply(destinationChannels[ch], gain,
+                                              numSamples);
+      }
+
+      // Safety limiter: never let audio exceed 1.0 full scale into the DAW
+      juce::FloatVectorOperations::clip(destinationChannels[ch],
+                                        destinationChannels[ch], -1.0f, 1.0f,
+                                        numSamples);
+    }
+
+    // Micro-fade in on start to eliminate transient clicks
+    if (needsFadeIn.load()) {
+      const int fadeLen = juce::jmin(64, numSamples);
+      for (int ch = 0; ch < numChannels; ++ch) {
+        for (int f = 0; f < fadeLen; ++f) {
+          float factor = (float)f / (float)fadeLen;
+          destinationChannels[ch][f] *= factor;
+        }
+      }
+      needsFadeIn.store(false);
+    }
+
+    audioFifo.finishedRead(numSamples);
+    return numSamples;
+  }
+
+  // Audio Input: Send DAW audio (e.g. for sampling in YPC2000)
+  void sendAudioToBrowser(const float *const *sourceChannels, int numChannels,
+                          int numSamples) {
+    if (!clientConnected.load() || numSamples <= 0 || numChannels <= 0)
+      return;
+
+    const int chs = juce::jmin(numChannels, 2);
+    const size_t headerSize = 4;
+    const size_t pcmBytes =
+        static_cast<size_t>(numSamples * chs) * sizeof(float);
+    std::vector<uint8_t> packet(headerSize + pcmBytes);
+
+    packet[0] = 0x01; // Audio Input opcode
+    packet[1] = static_cast<uint8_t>(chs);
+    packet[2] = static_cast<uint8_t>(numSamples & 0xFF);
+    packet[3] = static_cast<uint8_t>((numSamples >> 8) & 0xFF);
+
+    float *f32 = reinterpret_cast<float *>(packet.data() + headerSize);
+    for (int i = 0; i < numSamples; ++i) {
+      for (int ch = 0; ch < chs; ++ch) {
+        f32[i * chs + ch] = sourceChannels[ch][i];
+      }
+    }
+
+    sendWebSocketBinary(packet.data(), packet.size());
+  }
+
+  // MIDI: Send DAW MIDI to browser
+  void sendMidiToBrowser(const juce::MidiMessage &msg) {
+    if (msg.getRawDataSize() < 1)
+      return;
+
+    midiInActivity.store(true); // Signal DAW input activity!
+
+    if (!clientConnected.load())
+      return;
+
+    const uint8_t *raw = msg.getRawData();
+    const int size = msg.getRawDataSize();
+
+    std::vector<uint8_t> packet(1 + static_cast<size_t>(size));
+    packet[0] = 0x02; // MIDI packet
+    std::memcpy(packet.data() + 1, raw, static_cast<size_t>(size));
+
+    sendWebSocketBinary(packet.data(), packet.size());
+  }
+
+  // MIDI: Inject MIDI received from browser (called from WebSocket or Native
+  // IPC)
+  void injectMidiFromBrowser(int status, int d1, int d2) {
+    juce::MidiMessage msg(static_cast<uint8_t>(status),
+                          static_cast<uint8_t>(d1), static_cast<uint8_t>(d2));
+    std::lock_guard<std::mutex> lock(midiMutex);
+    incomingMidi.push_back(msg);
+    midiInActivity.store(true);
+  }
+
+  // MIDI: Read MIDI received from browser (called from processBlock)
+  void getMidiFromBrowser(juce::MidiBuffer &destBuffer, int sampleOffset = 0) {
+    std::lock_guard<std::mutex> lock(midiMutex);
+    for (const auto &msg : incomingMidi) {
+      destBuffer.addEvent(msg, sampleOffset);
+    }
+    if (!incomingMidi.empty()) {
+      midiOutActivity.store(true); // Signal DAW output activity!
+      incomingMidi.clear();
+    }
+  }
+
+  float getPeakAudioOutLevel() { return peakAudioOut.exchange(0.0f); }
+
+  bool checkAndResetMidiInActivity() { return midiInActivity.exchange(false); }
+
+  bool checkAndResetMidiOutActivity() {
+    return midiOutActivity.exchange(false);
+  }
+
+  void writeAudioToFifo(const float *interleavedData, int numChannels,
+                        int numSamples, double sourceSampleRate = 0.0) {
+    const std::lock_guard<std::mutex> fifoLock(fifoWriteMutex);
+    notifyNativeAudioReceived();
+
+    const double currentDawRate = (double)dawSampleRate.load();
+    const double srcRate =
+        (sourceSampleRate > 1000.0) ? sourceSampleRate : currentDawRate;
+
+    // Perform Hermite 4-point cubic resampling if browser sample rate differs
+    // from DAW
+    const bool needsResampling = (std::abs(srcRate - currentDawRate) > 5.0 &&
+                                  srcRate > 1000.0 && currentDawRate > 1000.0);
+
+    std::vector<float> resampledBuffer;
+    const float *dataToWrite = interleavedData;
+    int samplesToWrite = numSamples;
+
+    if (needsResampling) {
+      const double ratio = currentDawRate / srcRate;
+      samplesToWrite = juce::jmax(1, (int)std::round(numSamples * ratio));
+      resampledBuffer.resize(static_cast<size_t>(samplesToWrite * 2));
+
+      for (int i = 0; i < samplesToWrite; ++i) {
+        double srcPos = i / ratio;
+        int idx = (int)srcPos;
+        float frac = static_cast<float>(srcPos - idx);
+
+        for (int ch = 0; ch < 2; ++ch) {
+          auto getS = [&](int pos) -> float {
+            int p = juce::jlimit(0, numSamples - 1, pos);
+            int chIdx = (numChannels > 1) ? ch : 0;
+            return interleavedData[p * numChannels + chIdx];
+          };
+
+          float y0 = getS(idx - 1);
+          float y1 = getS(idx);
+          float y2 = getS(idx + 1);
+          float y3 = getS(idx + 2);
+
+          float c0 = y1;
+          float c1 = 0.5f * (y2 - y0);
+          float c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+          float c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+
+          float val = ((c3 * frac + c2) * frac + c1) * frac + c0;
+          resampledBuffer[static_cast<size_t>(i * 2 + ch)] = val;
+        }
+      }
+      dataToWrite = resampledBuffer.data();
+    }
+
+    // ZERO-LATENCY ENFORCEMENT:
+    // Never allow FIFO backlog to accumulate while DAW is idle or reading
+    // slowly. Cap the maximum ready samples to a tight real-time window
+    // (~5-10ms).
+    int targetCushion = jitterCushionSamples.load();
+    if (targetCushion <= 0)
+      targetCushion = 256;
+    const int maxBacklog = juce::jmax(512, targetCushion * 2);
+
+    int ready = audioFifo.getNumReady();
+    if (ready > maxBacklog) {
+      int toDiscard = ready - maxBacklog;
+      audioFifo.finishedRead(toDiscard);
+    }
+
+    int freeSpace = audioFifo.getFreeSpace();
+    if (freeSpace < samplesToWrite) {
+      // FIFO overflow (browser producing faster than the DAW is consuming):
+      // drop the oldest samples to make room. Fade the last few surviving
+      // samples right at the cut point so the discontinuity isn't heard as
+      // a click.
+      int toDiscard = samplesToWrite - freeSpace;
+      int available = audioFifo.getNumReady();
+      if (toDiscard > available)
+        toDiscard = available;
+
+      if (toDiscard > 0) {
+        const int fadeLen = juce::jmin(32, available - toDiscard);
+        if (fadeLen > 0) {
+          int fStart1, fSize1, fStart2, fSize2;
+          audioFifo.prepareToRead(toDiscard + fadeLen, fStart1, fSize1, fStart2,
+                                  fSize2);
+          // Apply a short fade-out ramp to the tail of what remains after
+          // discarding
+          for (int ch = 0; ch < audioRingBuffer.getNumChannels(); ++ch) {
+            for (int f = 0; f < fadeLen; ++f) {
+              // Ramp 0 -> 1 across the new start of the buffer, so the
+              // discontinuity left behind by the discarded samples is
+              // attenuated rather than heard as a hard jump/click.
+              float factor = (float)(f + 1) / (float)fadeLen;
+              int readIdx = toDiscard + f;
+              int pos = (readIdx < fSize1) ? (fStart1 + readIdx)
+                                           : (fStart2 + (readIdx - fSize1));
+              audioRingBuffer.setSample(
+                  ch, pos, audioRingBuffer.getSample(ch, pos) * factor);
             }
+          }
         }
-
-        audioFifo.finishedRead(size1 + size2);
-        return samplesToRead;
+        audioFifo.finishedRead(toDiscard);
+      }
     }
 
-    // Audio Input: Send DAW audio (e.g. for sampling in YPC2000)
-    void sendAudioToBrowser(const float* const* sourceChannels, int numChannels, int numSamples)
-    {
-        if (!clientConnected.load() || numSamples <= 0 || numChannels <= 0)
-            return;
+    int start1, size1, start2, size2;
+    audioFifo.prepareToWrite(samplesToWrite, start1, size1, start2, size2);
 
-        const int chs = juce::jmin(numChannels, 2);
-        const size_t headerSize = 4;
-        const size_t pcmBytes = static_cast<size_t>(numSamples * chs) * sizeof(float);
-        std::vector<uint8_t> packet(headerSize + pcmBytes);
+    float maxPeak = 0.0f;
+    const int inChs = needsResampling ? 2 : numChannels;
 
-        packet[0] = 0x01; // Audio Input opcode
-        packet[1] = static_cast<uint8_t>(chs);
-        packet[2] = static_cast<uint8_t>(numSamples & 0xFF);
-        packet[3] = static_cast<uint8_t>((numSamples >> 8) & 0xFF);
-
-        float* f32 = reinterpret_cast<float*>(packet.data() + headerSize);
-        for (int i = 0; i < numSamples; ++i)
-        {
-            for (int ch = 0; ch < chs; ++ch)
-            {
-                f32[i * chs + ch] = sourceChannels[ch][i];
-            }
-        }
-
-        sendWebSocketBinary(packet.data(), packet.size());
+    for (int i = 0; i < size1; ++i) {
+      float s0 = dataToWrite[i * inChs + 0];
+      float s1 = inChs > 1 ? dataToWrite[i * inChs + 1] : s0;
+      audioRingBuffer.setSample(0, start1 + i, s0);
+      audioRingBuffer.setSample(1, start1 + i, s1);
+      maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
     }
 
-    // MIDI: Send DAW MIDI to browser
-    void sendMidiToBrowser(const juce::MidiMessage& msg)
-    {
-        if (msg.getRawDataSize() < 1)
-            return;
-
-        midiInActivity.store(true); // Signal DAW input activity!
-
-        if (!clientConnected.load())
-            return;
-
-        const uint8_t* raw = msg.getRawData();
-        const int size = msg.getRawDataSize();
-
-        std::vector<uint8_t> packet(1 + static_cast<size_t>(size));
-        packet[0] = 0x02; // MIDI packet
-        std::memcpy(packet.data() + 1, raw, static_cast<size_t>(size));
-
-        sendWebSocketBinary(packet.data(), packet.size());
+    for (int i = 0; i < size2; ++i) {
+      int srcIdx = (size1 + i) * inChs;
+      float s0 = dataToWrite[srcIdx + 0];
+      float s1 = inChs > 1 ? dataToWrite[srcIdx + 1] : s0;
+      audioRingBuffer.setSample(0, start2 + i, s0);
+      audioRingBuffer.setSample(1, start2 + i, s1);
+      maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
     }
 
-    // MIDI: Inject MIDI received from browser (called from WebSocket or Native IPC)
-    void injectMidiFromBrowser(int status, int d1, int d2)
-    {
-        juce::MidiMessage msg(static_cast<uint8_t>(status),
-                              static_cast<uint8_t>(d1),
-                              static_cast<uint8_t>(d2));
-        std::lock_guard<std::mutex> lock(midiMutex);
-        incomingMidi.push_back(msg);
-        midiInActivity.store(true);
-    }
+    audioFifo.finishedWrite(size1 + size2);
 
-    // MIDI: Read MIDI received from browser (called from processBlock)
-    void getMidiFromBrowser(juce::MidiBuffer& destBuffer, int sampleOffset = 0)
-    {
-        std::lock_guard<std::mutex> lock(midiMutex);
-        for (const auto& msg : incomingMidi)
-        {
-            destBuffer.addEvent(msg, sampleOffset);
-        }
-        if (!incomingMidi.empty())
-        {
-            midiOutActivity.store(true); // Signal DAW output activity!
-            incomingMidi.clear();
-        }
-    }
-
-    float getPeakAudioOutLevel()
-    {
-        return peakAudioOut.exchange(0.0f);
-    }
-
-    bool checkAndResetMidiInActivity()
-    {
-        return midiInActivity.exchange(false);
-    }
-
-    bool checkAndResetMidiOutActivity()
-    {
-        return midiOutActivity.exchange(false);
-    }
-
-    void writeAudioToFifo(const float* interleavedData, int numChannels, int numSamples)
-    {
-        notifyNativeAudioReceived();
-
-        int freeSpace = audioFifo.getFreeSpace();
-        if (freeSpace < numSamples)
-        {
-            int toDiscard = numSamples - freeSpace;
-            audioFifo.finishedRead(toDiscard);
-        }
-
-        int start1, size1, start2, size2;
-        audioFifo.prepareToWrite(numSamples, start1, size1, start2, size2);
-
-        float maxPeak = 0.0f;
-
-        for (int i = 0; i < size1; ++i)
-        {
-            float s0 = interleavedData[i * numChannels + 0];
-            float s1 = numChannels > 1 ? interleavedData[i * numChannels + 1] : s0;
-            audioRingBuffer.setSample(0, start1 + i, s0);
-            audioRingBuffer.setSample(1, start1 + i, s1);
-            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
-        }
-
-        for (int i = 0; i < size2; ++i)
-        {
-            int srcIdx = (size1 + i) * numChannels;
-            float s0 = interleavedData[srcIdx + 0];
-            float s1 = numChannels > 1 ? interleavedData[srcIdx + 1] : s0;
-            audioRingBuffer.setSample(0, start2 + i, s0);
-            audioRingBuffer.setSample(1, start2 + i, s1);
-            maxPeak = juce::jmax(maxPeak, std::abs(s0), std::abs(s1));
-        }
-
-        audioFifo.finishedWrite(size1 + size2);
-
-        float currentPeak = peakAudioOut.load();
-        if (maxPeak > currentPeak)
-            peakAudioOut.store(maxPeak);
-    }
+    float currentPeak = peakAudioOut.load();
+    if (maxPeak > currentPeak)
+      peakAudioOut.store(maxPeak);
+  }
 
 private:
-    class ClientWorkerThread : public juce::Thread
-    {
-    public:
-        ClientWorkerThread(WebBridgeServer& owner, std::unique_ptr<juce::StreamingSocket> sock)
-            : juce::Thread("WSWorker"), server(owner), socket(std::move(sock))
-        {
-            startThread(juce::Thread::Priority::high);
-        }
-
-        ~ClientWorkerThread() override
-        {
-            signalThreadShouldExit();
-            if (socket != nullptr)
-                socket->close();
-            stopThread(1000);
-        }
-
-        void run() override
-        {
-            server.runWebSocketLoop(*socket);
-        }
-
-        juce::StreamingSocket* getSocket() const noexcept { return socket.get(); }
-
-    private:
-        WebBridgeServer& server;
-        std::unique_ptr<juce::StreamingSocket> socket;
-    };
-
-    void stopActiveWorker()
-    {
-        std::unique_ptr<ClientWorkerThread> oldWorker;
-        {
-            std::lock_guard<std::mutex> lock(workerMutex);
-            oldWorker = std::move(activeWorker);
-        }
-        oldWorker.reset();
-        clientConnected.store(false);
+  class ClientWorkerThread : public juce::Thread {
+  public:
+    ClientWorkerThread(WebBridgeServer &owner,
+                       std::unique_ptr<juce::StreamingSocket> sock)
+        : juce::Thread("WSWorker"), server(owner), socket(std::move(sock)) {
+      startThread(juce::Thread::Priority::high);
     }
 
-    void run() override
-    {
-        while (!threadShouldExit() && !shouldStop)
-        {
-            serverSocket = std::make_unique<juce::StreamingSocket>();
-
-            int port = activePort.load();
-            bool bound = false;
-
-            for (int attempt = 0; attempt < 20; ++attempt)
-            {
-                if (serverSocket->createListener(port, "127.0.0.1"))
-                {
-                    activePort.store(port);
-                    bound = true;
-                    break;
-                }
-                port++;
-            }
-
-            if (!bound)
-            {
-                wait(2000);
-                continue;
-            }
-
-            while (!threadShouldExit() && !shouldStop)
-            {
-                auto* client = serverSocket->waitForNextConnection();
-                if (client == nullptr)
-                {
-                    wait(20);
-                    continue;
-                }
-
-                handleClientConnection(client);
-            }
-        }
+    ~ClientWorkerThread() override {
+      signalThreadShouldExit();
+      if (socket != nullptr)
+        socket->close();
+      stopThread(1000);
     }
 
-    void handleClientConnection(juce::StreamingSocket* client)
+    void run() override { server.runWebSocketLoop(*socket); }
+
+    juce::StreamingSocket *getSocket() const noexcept { return socket.get(); }
+
+  private:
+    WebBridgeServer &server;
+    std::unique_ptr<juce::StreamingSocket> socket;
+  };
+
+  void stopActiveWorkers() {
+    std::vector<std::unique_ptr<ClientWorkerThread>> oldWorkers;
     {
-        std::unique_ptr<juce::StreamingSocket> sock(client);
-        char buffer[2048];
-        juce::String request;
+      std::lock_guard<std::mutex> lock(workerMutex);
+      oldWorkers = std::move(activeWorkers);
+    }
+    oldWorkers.clear();
+    clientConnected.store(false);
+  }
 
-        const auto startTime = juce::Time::getCurrentTime();
-        while ((juce::Time::getCurrentTime() - startTime).inMilliseconds() < 2500)
-        {
-            int bytesRead = sock->read(buffer, sizeof(buffer) - 1, false);
-            if (bytesRead > 0)
-            {
-                buffer[bytesRead] = 0;
-                request += juce::String::fromUTF8(buffer, bytesRead);
-                if (request.contains("\r\n\r\n"))
-                    break;
-            }
-            else
-            {
-                wait(10);
-            }
+  void stopActiveWorker() { stopActiveWorkers(); }
+
+  void run() override {
+    while (!threadShouldExit() && !shouldStop) {
+      serverSocket = std::make_unique<juce::StreamingSocket>();
+
+      int port = activePort.load();
+      bool bound = false;
+
+      for (int attempt = 0; attempt < 20; ++attempt) {
+        if (serverSocket->createListener(port, "127.0.0.1")) {
+          activePort.store(port);
+          bound = true;
+          break;
+        }
+        port++;
+      }
+
+      if (!bound) {
+        wait(2000);
+        continue;
+      }
+
+      while (!threadShouldExit() && !shouldStop) {
+        auto *client = serverSocket->waitForNextConnection();
+        if (client == nullptr) {
+          wait(20);
+          continue;
         }
 
-        if (request.isEmpty())
-            return;
+        handleClientConnection(client);
+      }
+    }
+  }
 
-        // Check if WebSocket upgrade
-        if (request.containsIgnoreCase("Upgrade: websocket"))
-        {
-            if (handleWebSocketUpgrade(*sock, request))
-            {
-                stopActiveWorker();
-                {
-                    std::lock_guard<std::mutex> lock(workerMutex);
-                    activeWorker = std::make_unique<ClientWorkerThread>(*this, std::move(sock));
-                    clientConnected.store(true);
-                }
-            }
-        }
-        else
-        {
-            handleHttpStaticFile(*sock, request);
-        }
+  void handleClientConnection(juce::StreamingSocket *client) {
+    std::unique_ptr<juce::StreamingSocket> sock(client);
+    char buffer[2048];
+    juce::String request;
+
+    const auto startTime = juce::Time::getCurrentTime();
+    while ((juce::Time::getCurrentTime() - startTime).inMilliseconds() < 2500) {
+      int bytesRead = sock->read(buffer, sizeof(buffer) - 1, false);
+      if (bytesRead > 0) {
+        buffer[bytesRead] = 0;
+        request += juce::String::fromUTF8(buffer, bytesRead);
+        if (request.contains("\r\n\r\n"))
+          break;
+      } else {
+        wait(10);
+      }
     }
 
-    bool handleWebSocketUpgrade(juce::StreamingSocket& socket, const juce::String& request)
-    {
-        juce::String secKey;
-        const auto lines = juce::StringArray::fromLines(request);
-        for (const auto& line : lines)
-        {
-            if (line.startsWithIgnoreCase("Sec-WebSocket-Key:"))
-            {
-                secKey = line.fromFirstOccurrenceOf(":", false, false).trim();
-                break;
-            }
-        }
+    if (request.isEmpty())
+      return;
 
-        if (secKey.isEmpty())
-            return false;
+    // Check if WebSocket upgrade
+    if (request.containsIgnoreCase("Upgrade: websocket")) {
+      if (handleWebSocketUpgrade(*sock, request)) {
+        std::lock_guard<std::mutex> lock(workerMutex);
+        activeWorkers.erase(
+            std::remove_if(activeWorkers.begin(), activeWorkers.end(),
+                           [](const std::unique_ptr<ClientWorkerThread> &w) {
+                             return w == nullptr || !w->isThreadRunning();
+                           }),
+            activeWorkers.end());
 
-        juce::String concat = secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-        auto shaDigest = Sha1::compute(concat.toStdString());
-        juce::String acceptKey = juce::Base64::toBase64(shaDigest.data(), shaDigest.size());
+        activeWorkers.push_back(
+            std::make_unique<ClientWorkerThread>(*this, std::move(sock)));
+        clientConnected.store(true);
+      }
+    } else {
+      handleHttpStaticFile(*sock, request);
+    }
+  }
 
-        juce::String response = "HTTP/1.1 101 Switching Protocols\r\n"
-                                "Upgrade: websocket\r\n"
-                                "Connection: Upgrade\r\n"
-                                "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
-
-        auto utf8 = response.toRawUTF8();
-        return socket.write(utf8, (int)std::strlen(utf8)) > 0;
+  bool handleWebSocketUpgrade(juce::StreamingSocket &socket,
+                              const juce::String &request) {
+    juce::String secKey;
+    const auto lines = juce::StringArray::fromLines(request);
+    for (const auto &line : lines) {
+      if (line.startsWithIgnoreCase("Sec-WebSocket-Key:")) {
+        secKey = line.fromFirstOccurrenceOf(":", false, false).trim();
+        break;
+      }
     }
 
-    void handleHttpStaticFile(juce::StreamingSocket& socket, const juce::String& request)
-    {
-        juce::String firstLine = request.upToFirstOccurrenceOf("\r\n", false, false);
-        auto tokens = juce::StringArray::fromTokens(firstLine, " ", "");
-        if (tokens.size() < 2 || (tokens[0] != "GET" && tokens[0] != "HEAD"))
-        {
-            sendHttpResponse(socket, 400, "Bad Request", "text/plain", "Bad Request");
-            return;
-        }
+    if (secKey.isEmpty())
+      return false;
 
-        juce::String path = tokens[1].upToFirstOccurrenceOf("?", false, false);
+    juce::String concat = secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    auto shaDigest = Sha1::compute(concat.toStdString());
+    juce::String acceptKey =
+        juce::Base64::toBase64(shaDigest.data(), shaDigest.size());
 
-        if (path == "/bridge.js" || path == "bridge.js")
-        {
-            juce::String js = getInjectionScript(activePort.load());
-            sendHttpResponse(socket, 200, "OK", "application/javascript; charset=utf-8", js);
-            return;
-        }
+    juce::String response = "HTTP/1.1 101 Switching Protocols\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            "Sec-WebSocket-Accept: " +
+                            acceptKey + "\r\n\r\n";
 
-        if (path == "/" || path == "/index.html")
-        {
-            juce::String bookmarklet = "javascript:(function(){const s=document.createElement('script');s.src='http://127.0.0.1:"
-                                     + juce::String(activePort.load()) + "/bridge.js?t='+Date.now();document.head.appendChild(s);})();";
+    auto utf8 = response.toRawUTF8();
+    return socket.write(utf8, (int)std::strlen(utf8)) > 0;
+  }
 
-            juce::String html = R"HTML(<!DOCTYPE html>
+  void handleHttpStaticFile(juce::StreamingSocket &socket,
+                            const juce::String &request) {
+    juce::String firstLine =
+        request.upToFirstOccurrenceOf("\r\n", false, false);
+    auto tokens = juce::StringArray::fromTokens(firstLine, " ", "");
+    if (tokens.size() < 2 || (tokens[0] != "GET" && tokens[0] != "HEAD")) {
+      sendHttpResponse(socket, 400, "Bad Request", "text/plain", "Bad Request");
+      return;
+    }
+
+    juce::String path = tokens[1].upToFirstOccurrenceOf("?", false, false);
+
+    if (path == "/bridge.js" || path == "bridge.js") {
+      juce::String js = getInjectionScript(activePort.load());
+      sendHttpResponse(socket, 200, "OK",
+                       "application/javascript; charset=utf-8", js);
+      return;
+    }
+
+    if (path == "/" || path == "/index.html") {
+      juce::String bookmarklet =
+          "javascript:(function(){const "
+          "s=document.createElement('script');s.src='http://127.0.0.1:" +
+          juce::String(activePort.load()) +
+          "/bridge.js?t='+Date.now();document.head.appendChild(s);})();";
+
+      juce::String html = R"HTML(<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -521,255 +629,284 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
 <body>
 <div class="card">
   <h1>BrowserInstrument VST3</h1>
-  <p>Bitwig Studio Web Audio & MIDI Bridge is active on port <strong>)HTML" + juce::String(activePort.load()) + R"HTML(</strong></p>
+  <p>Bitwig Studio Web Audio & MIDI Bridge is active on port <strong>)HTML" +
+                          juce::String(activePort.load()) + R"HTML(</strong></p>
   <p>Trascina questo pulsante nei segnalibri del browser per connettere al volo qualsiasi pagina web alla traccia di Bitwig:</p>
-  <a class="btn" href=")HTML" + bookmarklet + R"HTML(">▶ Connetti Tab a Bitwig</a>
+  <a class="btn" href=")HTML" +
+                          bookmarklet + R"HTML(">▶ Connetti Tab a Bitwig</a>
   <div class="tip">Supporta YPC-2000, Cardinal Modular, AcidMachine, WebSynths, Roland50 e YouTube!</div>
 </div>
 </body>
 </html>)HTML";
 
-            sendHttpResponse(socket, 200, "OK", "text/html; charset=utf-8", html);
-            return;
-        }
-
-        if (path.startsWith("/offline/"))
-            path = path.substring(9);
-        else if (path.startsWith("/"))
-            path = path.substring(1);
-
-        juce::File targetFile = getOfflineDirectory().getChildFile(path);
-        if (targetFile.isDirectory())
-            targetFile = targetFile.getChildFile("index.html");
-
-        if (!targetFile.existsAsFile())
-        {
-            juce::String notFound = "<html><body><h2>404 Not Found</h2><p>Offline instrument not found: " + path + "</p></body></html>";
-            sendHttpResponse(socket, 404, "Not Found", "text/html", notFound);
-            return;
-        }
-
-        juce::MemoryBlock fileData;
-        if (!targetFile.loadFileAsData(fileData))
-        {
-            sendHttpResponse(socket, 500, "Error", "text/plain", "Failed to read file");
-            return;
-        }
-
-        juce::String mime = getMimeType(targetFile.getFileExtension());
-        sendHttpResponse(socket, 200, "OK", mime, fileData.getData(), fileData.getSize());
+      sendHttpResponse(socket, 200, "OK", "text/html; charset=utf-8", html);
+      return;
     }
 
-    static juce::String getMimeType(const juce::String& ext)
-    {
-        auto e = ext.toLowerCase();
-        if (e == ".html" || e == ".htm") return "text/html; charset=utf-8";
-        if (e == ".js" || e == ".mjs")   return "application/javascript; charset=utf-8";
-        if (e == ".css")                 return "text/css; charset=utf-8";
-        if (e == ".json")                return "application/json";
-        if (e == ".png")                 return "image/png";
-        if (e == ".jpg" || e == ".jpeg") return "image/jpeg";
-        if (e == ".svg")                 return "image/svg+xml";
-        if (e == ".wasm")                return "application/wasm";
-        if (e == ".wav")                 return "audio/wav";
-        if (e == ".mp3")                 return "audio/mpeg";
-        return "application/octet-stream";
+    if (path.startsWith("/offline/"))
+      path = path.substring(9);
+    else if (path.startsWith("/"))
+      path = path.substring(1);
+
+    juce::File targetFile = getOfflineDirectory().getChildFile(path);
+    if (targetFile.isDirectory())
+      targetFile = targetFile.getChildFile("index.html");
+
+    if (!targetFile.existsAsFile()) {
+      juce::String notFound = "<html><body><h2>404 Not Found</h2><p>Offline "
+                              "instrument not found: " +
+                              path + "</p></body></html>";
+      sendHttpResponse(socket, 404, "Not Found", "text/html", notFound);
+      return;
     }
 
-    void sendHttpResponse(juce::StreamingSocket& socket, int statusCode, const juce::String& statusText,
-                          const juce::String& contentType, const void* data, size_t size)
-    {
-        juce::String header = "HTTP/1.1 " + juce::String(statusCode) + " " + statusText + "\r\n"
-                              "Content-Type: " + contentType + "\r\n"
-                              "Content-Length: " + juce::String(size) + "\r\n"
-                              "Access-Control-Allow-Origin: *\r\n"
-                              "Connection: close\r\n\r\n";
-
-        auto utf8 = header.toRawUTF8();
-        socket.write(utf8, (int)std::strlen(utf8));
-        if (size > 0 && data != nullptr)
-            socket.write(data, (int)size);
+    juce::MemoryBlock fileData;
+    if (!targetFile.loadFileAsData(fileData)) {
+      sendHttpResponse(socket, 500, "Error", "text/plain",
+                       "Failed to read file");
+      return;
     }
 
-    void sendHttpResponse(juce::StreamingSocket& socket, int statusCode, const juce::String& statusText,
-                          const juce::String& contentType, const juce::String& textBody)
-    {
-        auto utf8Body = textBody.toRawUTF8();
-        sendHttpResponse(socket, statusCode, statusText, contentType, utf8Body, std::strlen(utf8Body));
+    juce::String mime = getMimeType(targetFile.getFileExtension());
+    sendHttpResponse(socket, 200, "OK", mime, fileData.getData(),
+                     fileData.getSize());
+  }
+
+  static juce::String getMimeType(const juce::String &ext) {
+    auto e = ext.toLowerCase();
+    if (e == ".html" || e == ".htm")
+      return "text/html; charset=utf-8";
+    if (e == ".js" || e == ".mjs")
+      return "application/javascript; charset=utf-8";
+    if (e == ".css")
+      return "text/css; charset=utf-8";
+    if (e == ".json")
+      return "application/json";
+    if (e == ".png")
+      return "image/png";
+    if (e == ".jpg" || e == ".jpeg")
+      return "image/jpeg";
+    if (e == ".svg")
+      return "image/svg+xml";
+    if (e == ".wasm")
+      return "application/wasm";
+    if (e == ".wav")
+      return "audio/wav";
+    if (e == ".mp3")
+      return "audio/mpeg";
+    return "application/octet-stream";
+  }
+
+  void sendHttpResponse(juce::StreamingSocket &socket, int statusCode,
+                        const juce::String &statusText,
+                        const juce::String &contentType, const void *data,
+                        size_t size) {
+    juce::String header = "HTTP/1.1 " + juce::String(statusCode) + " " +
+                          statusText +
+                          "\r\n"
+                          "Content-Type: " +
+                          contentType +
+                          "\r\n"
+                          "Content-Length: " +
+                          juce::String(size) +
+                          "\r\n"
+                          "Access-Control-Allow-Origin: *\r\n"
+                          "Connection: close\r\n\r\n";
+
+    auto utf8 = header.toRawUTF8();
+    socket.write(utf8, (int)std::strlen(utf8));
+    if (size > 0 && data != nullptr)
+      socket.write(data, (int)size);
+  }
+
+  void sendHttpResponse(juce::StreamingSocket &socket, int statusCode,
+                        const juce::String &statusText,
+                        const juce::String &contentType,
+                        const juce::String &textBody) {
+    auto utf8Body = textBody.toRawUTF8();
+    sendHttpResponse(socket, statusCode, statusText, contentType, utf8Body,
+                     std::strlen(utf8Body));
+  }
+
+  void runWebSocketLoop(juce::StreamingSocket &socket) {
+    processWebSocketFrames(socket);
+    clientConnected.store(false);
+  }
+
+  void processWebSocketFrames(juce::StreamingSocket &socket) {
+    std::vector<uint8_t> frameBuffer;
+
+    while (!threadShouldExit() && !shouldStop && socket.isConnected()) {
+      uint8_t header[2];
+      int r = socket.read(header, 2, true);
+      if (r != 2)
+        break;
+
+      const uint8_t b0 = header[0];
+      const uint8_t b1 = header[1];
+
+      const uint8_t opcode = b0 & 0x0F;
+      const bool isMasked = (b1 & 0x80) != 0;
+      uint64_t payloadLen = b1 & 0x7F;
+
+      if (opcode == 0x08) // Close
+        break;
+
+      if (payloadLen == 126) {
+        uint8_t ext[2];
+        if (socket.read(ext, 2, true) != 2)
+          break;
+        payloadLen = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
+      } else if (payloadLen == 127) {
+        uint8_t ext[8];
+        if (socket.read(ext, 8, true) != 8)
+          break;
+        payloadLen = 0;
+        for (int i = 0; i < 8; ++i)
+          payloadLen = (payloadLen << 8) | ext[i];
+      }
+
+      uint8_t mask[4] = {0, 0, 0, 0};
+      if (isMasked) {
+        if (socket.read(mask, 4, true) != 4)
+          break;
+      }
+
+      frameBuffer.resize(payloadLen);
+      size_t bytesRead = 0;
+      while (bytesRead < payloadLen) {
+        int chunk =
+            socket.read(frameBuffer.data() + bytesRead,
+                        static_cast<int>(payloadLen - bytesRead), false);
+        if (chunk <= 0)
+          break;
+        bytesRead += chunk;
+      }
+      if (bytesRead != payloadLen)
+        break;
+
+      if (isMasked) {
+        for (size_t i = 0; i < payloadLen; ++i)
+          frameBuffer[i] ^= mask[i % 4];
+      }
+
+      if (opcode == 0x09) // Ping
+      {
+        sendWebSocketFrame(0x0A, frameBuffer.data(),
+                           frameBuffer.size()); // Pong
+        continue;
+      }
+
+      if (opcode == 0x02) // Binary frame
+      {
+        handleIncomingBinaryPayload(frameBuffer.data(), frameBuffer.size());
+      }
+    }
+  }
+
+  void handleIncomingBinaryPayload(const uint8_t *data, size_t size) {
+    if (size < 1)
+      return;
+
+    const uint8_t packetType = data[0];
+
+    if (packetType == 0x01 && size >= 4) {
+      // Audio Output from Browser: [0x01, numChannels, lenLo, lenHi,
+      // optional(sr0, sr1, sr2, sr3), ...float32]
+      const int chs = data[1];
+      const int sampleCount = data[2] | (data[3] << 8);
+      int srcRate = 0;
+      size_t headerSize = 4;
+
+      if (size >= 8 + static_cast<size_t>(sampleCount * chs) * sizeof(float)) {
+        headerSize = 8;
+        srcRate =
+            (int)(data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24));
+      }
+
+      const size_t expectedBytes =
+          headerSize + static_cast<size_t>(sampleCount * chs) * sizeof(float);
+
+      if (size >= expectedBytes && chs > 0 && sampleCount > 0) {
+        const float *f32 = reinterpret_cast<const float *>(data + headerSize);
+        writeAudioToFifo(f32, chs, sampleCount, (double)srcRate);
+      }
+    } else if (packetType == 0x02 && size >= 4) {
+      // MIDI from Browser: [0x02, status, data1, data2]
+      injectMidiFromBrowser(data[1], data[2], data[3]);
+    }
+  }
+
+  void sendWebSocketBinary(const uint8_t *data, size_t size) {
+    sendWebSocketFrame(0x02, data, size);
+  }
+
+  void sendWebSocketFrame(uint8_t opcode, const uint8_t *payload,
+                          size_t payloadLen) {
+    std::lock_guard<std::mutex> lock(socketWriteMutex);
+    std::lock_guard<std::mutex> wlock(workerMutex);
+
+    if (activeWorkers.empty())
+      return;
+
+    std::vector<uint8_t> frame;
+    frame.reserve(10 + payloadLen);
+
+    frame.push_back(0x80 | (opcode & 0x0F));
+
+    if (payloadLen <= 125) {
+      frame.push_back(static_cast<uint8_t>(payloadLen));
+    } else if (payloadLen <= 65535) {
+      frame.push_back(126);
+      frame.push_back(static_cast<uint8_t>((payloadLen >> 8) & 0xFF));
+      frame.push_back(static_cast<uint8_t>(payloadLen & 0xFF));
+    } else {
+      frame.push_back(127);
+      for (int i = 7; i >= 0; --i)
+        frame.push_back(static_cast<uint8_t>((payloadLen >> (i * 8)) & 0xFF));
     }
 
-    void runWebSocketLoop(juce::StreamingSocket& socket)
-    {
-        processWebSocketFrames(socket);
-        clientConnected.store(false);
+    if (payloadLen > 0 && payload != nullptr) {
+      frame.insert(frame.end(), payload, payload + payloadLen);
     }
 
-    void processWebSocketFrames(juce::StreamingSocket& socket)
-    {
-        std::vector<uint8_t> frameBuffer;
-
-        while (!threadShouldExit() && !shouldStop && socket.isConnected())
-        {
-            uint8_t header[2];
-            int r = socket.read(header, 2, true);
-            if (r != 2)
-                break;
-
-            const uint8_t b0 = header[0];
-            const uint8_t b1 = header[1];
-
-            const uint8_t opcode = b0 & 0x0F;
-            const bool isMasked = (b1 & 0x80) != 0;
-            uint64_t payloadLen = b1 & 0x7F;
-
-            if (opcode == 0x08) // Close
-                break;
-
-            if (payloadLen == 126)
-            {
-                uint8_t ext[2];
-                if (socket.read(ext, 2, true) != 2) break;
-                payloadLen = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
-            }
-            else if (payloadLen == 127)
-            {
-                uint8_t ext[8];
-                if (socket.read(ext, 8, true) != 8) break;
-                payloadLen = 0;
-                for (int i = 0; i < 8; ++i)
-                    payloadLen = (payloadLen << 8) | ext[i];
-            }
-
-            uint8_t mask[4] = { 0, 0, 0, 0 };
-            if (isMasked)
-            {
-                if (socket.read(mask, 4, true) != 4) break;
-            }
-
-            frameBuffer.resize(payloadLen);
-            size_t bytesRead = 0;
-            while (bytesRead < payloadLen)
-            {
-                int chunk = socket.read(frameBuffer.data() + bytesRead,
-                                        static_cast<int>(payloadLen - bytesRead),
-                                        false);
-                if (chunk <= 0) break;
-                bytesRead += chunk;
-            }
-            if (bytesRead != payloadLen) break;
-
-            if (isMasked)
-            {
-                for (size_t i = 0; i < payloadLen; ++i)
-                    frameBuffer[i] ^= mask[i % 4];
-            }
-
-            if (opcode == 0x09) // Ping
-            {
-                sendWebSocketFrame(0x0A, frameBuffer.data(), frameBuffer.size()); // Pong
-                continue;
-            }
-
-            if (opcode == 0x02) // Binary frame
-            {
-                handleIncomingBinaryPayload(frameBuffer.data(), frameBuffer.size());
-            }
-        }
+    for (auto &w : activeWorkers) {
+      if (w != nullptr && w->getSocket() != nullptr &&
+          w->getSocket()->isConnected()) {
+        w->getSocket()->write(frame.data(), static_cast<int>(frame.size()));
+      }
     }
+  }
 
-    void handleIncomingBinaryPayload(const uint8_t* data, size_t size)
-    {
-        if (size < 1) return;
+  static constexpr int ringBufferSize = 65536;
 
-        const uint8_t packetType = data[0];
+  std::atomic<bool> shouldStop{false};
+  std::atomic<int> activePort{8788};
+  std::atomic<int> dawSampleRate{48000};
+  std::atomic<bool> clientConnected{false};
+  std::atomic<bool> nativeIpcActive{false};
+  std::atomic<int> nativeIpcWatchdog{0};
+  std::atomic<bool> midiInActivity{false};
+  std::atomic<bool> midiOutActivity{false};
+  std::atomic<float> peakAudioOut{0.0f};
+  std::atomic<int> jitterCushionSamples{256};
+  std::atomic<bool> isBuffering{true};
+  std::atomic<bool> needsFadeIn{true};
+  std::atomic<float> outputGain{1.0f};
 
-        if (packetType == 0x01 && size >= 4)
-        {
-            // Audio Output from Browser: [0x01, numChannels, lenLo, lenHi, ...float32]
-            const int chs = data[1];
-            const int sampleCount = data[2] | (data[3] << 8);
-            const size_t expectedBytes = 4 + static_cast<size_t>(sampleCount * chs) * sizeof(float);
+  std::unique_ptr<juce::StreamingSocket> serverSocket;
+  std::mutex fifoWriteMutex;
+  std::mutex workerMutex;
+  std::vector<std::unique_ptr<ClientWorkerThread>> activeWorkers;
+  std::mutex socketWriteMutex;
 
-            if (size >= expectedBytes && chs > 0 && sampleCount > 0)
-            {
-                const float* f32 = reinterpret_cast<const float*>(data + 4);
-                writeAudioToFifo(f32, chs, sampleCount);
-            }
-        }
-        else if (packetType == 0x02 && size >= 4)
-        {
-            // MIDI from Browser: [0x02, status, data1, data2]
-            injectMidiFromBrowser(data[1], data[2], data[3]);
-        }
-    }
+  juce::AbstractFifo audioFifo;
+  juce::AudioBuffer<float> audioRingBuffer;
 
-    void sendWebSocketBinary(const uint8_t* data, size_t size)
-    {
-        sendWebSocketFrame(0x02, data, size);
-    }
+  std::mutex midiMutex;
+  std::vector<juce::MidiMessage> incomingMidi;
 
-    void sendWebSocketFrame(uint8_t opcode, const uint8_t* payload, size_t payloadLen)
-    {
-        std::lock_guard<std::mutex> lock(socketWriteMutex);
-        std::lock_guard<std::mutex> wlock(workerMutex);
-
-        if (activeWorker == nullptr || activeWorker->getSocket() == nullptr || !activeWorker->getSocket()->isConnected())
-            return;
-
-        std::vector<uint8_t> frame;
-        frame.reserve(10 + payloadLen);
-
-        frame.push_back(0x80 | (opcode & 0x0F));
-
-        if (payloadLen <= 125)
-        {
-            frame.push_back(static_cast<uint8_t>(payloadLen));
-        }
-        else if (payloadLen <= 65535)
-        {
-            frame.push_back(126);
-            frame.push_back(static_cast<uint8_t>((payloadLen >> 8) & 0xFF));
-            frame.push_back(static_cast<uint8_t>(payloadLen & 0xFF));
-        }
-        else
-        {
-            frame.push_back(127);
-            for (int i = 7; i >= 0; --i)
-                frame.push_back(static_cast<uint8_t>((payloadLen >> (i * 8)) & 0xFF));
-        }
-
-        if (payloadLen > 0 && payload != nullptr)
-        {
-            frame.insert(frame.end(), payload, payload + payloadLen);
-        }
-
-        activeWorker->getSocket()->write(frame.data(), static_cast<int>(frame.size()));
-    }
-
-    static constexpr int ringBufferSize = 65536;
-
-    std::atomic<bool> shouldStop { false };
-    std::atomic<int> activePort { 8788 };
-    std::atomic<int> dawSampleRate { 48000 };
-    std::atomic<bool> clientConnected { false };
-    std::atomic<bool> nativeIpcActive { false };
-    std::atomic<int> nativeIpcWatchdog { 0 };
-    std::atomic<bool> midiInActivity { false };
-    std::atomic<bool> midiOutActivity { false };
-    std::atomic<float> peakAudioOut { 0.0f };
-
-    std::unique_ptr<juce::StreamingSocket> serverSocket;
-    std::mutex workerMutex;
-    std::unique_ptr<ClientWorkerThread> activeWorker;
-    std::mutex socketWriteMutex;
-
-    juce::AbstractFifo audioFifo;
-    juce::AudioBuffer<float> audioRingBuffer;
-
-    std::mutex midiMutex;
-    std::vector<juce::MidiMessage> incomingMidi;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WebBridgeServer)
+  JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(WebBridgeServer)
 };
 
 } // namespace WebBridge
