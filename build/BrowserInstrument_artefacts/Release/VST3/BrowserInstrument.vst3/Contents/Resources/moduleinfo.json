@@ -1,0 +1,48 @@
+{
+  "Name": "BrowserInstrument",
+  "Version": "1.0.0",
+  "Factory Info": {
+    "Vendor": "AudioWebLab",
+    "URL": "",
+    "E-Mail": "",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false,
+    },
+  },
+  "Classes": [
+    {
+      "CID": "ABCDEF019182FAEB41776C6242727749",
+      "Category": "Audio Module Class",
+      "Name": "BrowserInstrument",
+      "Vendor": "AudioWebLab",
+      "Version": "1.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Tools",
+      ],
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF011234ABCD41776C6242727749",
+      "Category": "Component Controller Class",
+      "Name": "BrowserInstrument",
+      "Vendor": "AudioWebLab",
+      "Version": "1.0.0",
+      "SDKVersion": "VST 3.8.0",
+      "Sub Categories": [
+        "Instrument",
+        "Tools",
+      ],
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+  ],
+}
