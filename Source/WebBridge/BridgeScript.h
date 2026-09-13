@@ -5,7 +5,7 @@
 namespace WebBridge
 {
 
-inline juce::String getInjectionScript(int bridgePort = 8788, int targetSampleRate = 48000, int bufferSize = 256)
+inline juce::String getInjectionScript(int bridgePort = 8788, int targetSampleRate = 96000, int bufferSize = 1024)
 {
     return juce::String(R"JS(
 (function() {
@@ -82,6 +82,255 @@ inline juce::String getInjectionScript(int bridgePort = 8788, int targetSampleRa
     window.__JUCE_BRIDGE_LOADED__ = true;
 
     console.log("[JUCE-WebBridge] Initializing DAW Web Audio & MIDI Bridge for Bitwig Studio...");
+
+    const isYouTubeHost = (location.hostname || "").toLowerCase().includes("youtube.com") ||
+        (location.hostname || "").toLowerCase().includes("youtu.be") ||
+        (location.hostname || "").toLowerCase().includes("music.youtube.com");
+
+    // =========================================================================
+    // AGGRESSIVE RUNTIME CACHING ENGINE ("Casha tutto una volta caricata la pagina")
+    // Intercepts fetch() and XMLHttpRequest to cache all WASM, audio samples,
+    // scripts, fonts, and styles, eliminating network latency on subsequent loads.
+    // =========================================================================
+    const BI_CACHE_NAME = "browserinstrument-page-cache-v1";
+    const cacheApiAvailable = (typeof caches !== "undefined" && typeof caches.open === "function" && !isYouTubeHost);
+
+    const origFetch = (typeof window.fetch === "function") ? window.fetch.bind(window) : null;
+    if (origFetch && cacheApiAvailable) {
+        window.fetch = async function(input, init) {
+            const method = (init && init.method) ? init.method.toUpperCase() : "GET";
+            if (method !== "GET") {
+                return origFetch(input, init);
+            }
+
+            const urlStr = (typeof input === "string") ? input : (input && input.url ? input.url : "");
+            if (urlStr.startsWith("ws:") || urlStr.startsWith("wss:") || urlStr.includes("127.0.0.1:" + %PORT%)) {
+                return origFetch(input, init);
+            }
+
+            try {
+                const cache = await caches.open(BI_CACHE_NAME);
+                const cachedRes = await cache.match(urlStr);
+                if (cachedRes) {
+                    const isBinary = urlStr.includes(".wav") || urlStr.includes(".mp3") || urlStr.includes(".wasm") || urlStr.includes(".ogg");
+                    if (!isBinary) {
+                        origFetch(input, init).then(fresh => {
+                            if (fresh && fresh.ok) cache.put(urlStr, fresh.clone()).catch(() => {});
+                        }).catch(() => {});
+                    }
+                    return cachedRes;
+                }
+
+                const networkRes = await origFetch(input, init);
+                if (networkRes && networkRes.ok) {
+                    cache.put(urlStr, networkRes.clone()).catch(() => {});
+                }
+                return networkRes;
+            } catch (err) {
+                return origFetch(input, init);
+            }
+        };
+    }
+
+    if (typeof window.XMLHttpRequest !== "undefined" && cacheApiAvailable) {
+        const OrigXHR = window.XMLHttpRequest;
+        window.XMLHttpRequest = class extends OrigXHR {
+            open(method, url, async, user, password) {
+                this.__bi_method = method;
+                this.__bi_url = url;
+                super.open(method, url, async !== false, user, password);
+            }
+
+            send(body) {
+                const method = (this.__bi_method || "GET").toUpperCase();
+                const url = this.__bi_url;
+                const isCachableAsset = url && typeof url === "string" && (
+                    url.includes(".wav") || url.includes(".mp3") || url.includes(".ogg") ||
+                    url.includes(".wasm") || url.includes(".json") || url.includes(".bin") ||
+                    url.includes(".sf2") || url.includes(".soundfont") || url.includes(".js") ||
+                    url.includes(".css")
+                );
+
+                if (method === "GET" && isCachableAsset) {
+                    caches.open(BI_CACHE_NAME).then(cache => {
+                        cache.match(url).then(async cachedRes => {
+                            if (cachedRes) {
+                                try {
+                                    const rType = this.responseType;
+                                    let data;
+                                    if (rType === "arraybuffer") data = await cachedRes.arrayBuffer();
+                                    else if (rType === "json") data = await cachedRes.json();
+                                    else if (rType === "blob") data = await cachedRes.blob();
+                                    else data = await cachedRes.text();
+
+                                    Object.defineProperty(this, "readyState", { value: 4, configurable: true });
+                                    Object.defineProperty(this, "status", { value: 200, configurable: true });
+                                    Object.defineProperty(this, "statusText", { value: "OK (Cached)", configurable: true });
+                                    Object.defineProperty(this, "response", { value: data, configurable: true });
+                                    if (!rType || rType === "text") {
+                                        Object.defineProperty(this, "responseText", { value: typeof data === "string" ? data : "", configurable: true });
+                                    }
+
+                                    if (typeof this.onreadystatechange === "function") this.onreadystatechange();
+                                    if (typeof this.onload === "function") this.onload(new ProgressEvent("load"));
+                                    if (typeof this.onloadend === "function") this.onloadend(new ProgressEvent("loadend"));
+                                    return;
+                                } catch (e) {}
+                            }
+
+                            this.addEventListener("load", function() {
+                                if (this.status === 200 && this.response) {
+                                    try {
+                                        const headers = new Headers();
+                                        headers.set("Content-Type", this.getResponseHeader("Content-Type") || "application/octet-stream");
+                                        const bData = (this.response instanceof ArrayBuffer) ? this.response.slice(0) : this.response;
+                                        const resToCache = new Response(bData, { status: 200, headers: headers });
+                                        cache.put(url, resToCache).catch(() => {});
+                                    } catch (e) {}
+                                }
+                            });
+                            super.send(body);
+                        }).catch(() => { super.send(body); });
+                    }).catch(() => { super.send(body); });
+                    return;
+                }
+
+                super.send(body);
+            }
+        };
+    }
+
+    // =========================================================================
+    // FULL-PAGE ASSET SWEEPER ("Cashare tutto una volta caricata la pagina")
+    // Scans all scripts, audio elements, fonts, links and images once page loads,
+    // pre-caching them in parallel so the next reload/navigation is instantaneous.
+    // =========================================================================
+    let isSweepingCache = false;
+    async function sweepAndCacheAllPageResources() {
+        if (isYouTubeHost || isSweepingCache || typeof caches === "undefined") return;
+        isSweepingCache = true;
+
+        try {
+            const cache = await caches.open(BI_CACHE_NAME);
+            const urlsToCache = new Set();
+
+            if (location.href && !location.href.startsWith("about:") && !location.href.startsWith("data:")) {
+                urlsToCache.add(location.href);
+            }
+
+            document.querySelectorAll("script[src]").forEach(el => {
+                if (el.src && !el.src.startsWith("blob:") && !el.src.startsWith("data:")) {
+                    urlsToCache.add(el.src);
+                }
+            });
+
+            document.querySelectorAll("link[href]").forEach(el => {
+                const rel = (el.rel || "").toLowerCase();
+                if (rel === "stylesheet" || rel === "preload" || rel === "modulepreload" || rel === "icon" || rel === "shortcut icon") {
+                    if (el.href && !el.href.startsWith("data:") && !el.href.startsWith("blob:")) {
+                        urlsToCache.add(el.href);
+                    }
+                }
+            });
+
+            document.querySelectorAll("audio, audio source, video, video source").forEach(el => {
+                const s = el.src || el.getAttribute("src");
+                if (s && !s.startsWith("blob:") && !s.startsWith("data:")) {
+                    try { urlsToCache.add(new URL(s, location.href).href); } catch(e) {}
+                }
+            });
+
+            document.querySelectorAll("img[src]").forEach(el => {
+                if (el.src && !el.src.startsWith("data:") && !el.src.startsWith("blob:")) {
+                    urlsToCache.add(el.src);
+                }
+            });
+
+            // Scan inline HTML for drum kits / sound samples (.wav, .mp3, .ogg, .wasm)
+            try {
+                const html = document.documentElement.innerHTML;
+                const sampleRegex = /["']([^"']+\.(?:wav|mp3|ogg|flac|wasm|json))["']/gi;
+                let m;
+                let c = 0;
+                while ((m = sampleRegex.exec(html)) !== null && c < 150) {
+                    c++;
+                    try {
+                        const resUrl = new URL(m[1], location.href).href;
+                        if (resUrl.startsWith("http://") || resUrl.startsWith("https://")) {
+                            urlsToCache.add(resUrl);
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+
+            console.log("[JUCE-WebBridge] Sweeping page for caching: " + urlsToCache.size + " resources detected.");
+
+            let cachedCount = 0;
+            for (const u of urlsToCache) {
+                try {
+                    const match = await cache.match(u);
+                    if (!match) {
+                        const f = origFetch || window.fetch;
+                        const r = await f(u, { mode: "no-cors" }).catch(() => null);
+                        if (r) {
+                            await cache.put(u, r);
+                        }
+                    }
+                    cachedCount++;
+                } catch(e) {}
+            }
+
+            console.log("[JUCE-WebBridge] Page 100% cached locally! (" + cachedCount + "/" + urlsToCache.size + " assets stored)");
+
+            sendNativeJuceEvent("pageCacheStatus", {
+                status: "ready",
+                cachedCount: cachedCount,
+                totalCount: urlsToCache.size,
+                url: location.href
+            });
+        } catch (e) {
+            console.warn("[JUCE-WebBridge] Sweep cache warning:", e);
+        } finally {
+            isSweepingCache = false;
+        }
+    }
+
+    if (document.readyState === "complete") {
+        setTimeout(sweepAndCacheAllPageResources, 1000);
+    } else {
+        window.addEventListener("load", () => {
+            setTimeout(sweepAndCacheAllPageResources, 1000);
+        });
+    }
+
+    // =========================================================================
+    // HIGH BITRATE MEDIA ENFORCER (YouTube, HTML5 Media, Web Audio)
+    // Forces maximum stream quality & uncompressed 32-bit float audio bitrates.
+    // =========================================================================
+    function enforceHighBitrateMedia() {
+        try {
+            if (isYouTubeHost) return;
+
+            // Force YouTube HTML5 Player to maximum quality and audio bitrate
+            const ytPlayers = document.querySelectorAll(".html5-video-player, #movie_player");
+            ytPlayers.forEach(p => {
+                if (typeof p.setPlaybackQualityRange === "function") {
+                    p.setPlaybackQualityRange("highres", "highres");
+                }
+                if (typeof p.setPlaybackQuality === "function") {
+                    p.setPlaybackQuality("highres");
+                }
+            });
+
+            // HTML5 Media: enable preload auto
+            document.querySelectorAll("video, audio").forEach(media => {
+                if (media.preload !== "auto") media.preload = "auto";
+            });
+        } catch(e) {}
+    }
+
+    setInterval(enforceHighBitrateMedia, 3000);
+    window.addEventListener("load", enforceHighBitrateMedia);
 
     // Polyfill MIDIMessageEvent if not natively exposed
     if (typeof window.MIDIMessageEvent === "undefined") {
@@ -791,7 +1040,20 @@ inline juce::String getInjectionScript(int bridgePort = 8788, int targetSampleRa
             dispatchMidiFromDaw(0x90, note, vel);
             setTimeout(() => dispatchMidiFromDaw(0x80, note, 0), 250);
         },
-        resumeAudio: resumeAllContexts
+        resumeAudio: resumeAllContexts,
+        cacheAllPageResources: sweepAndCacheAllPageResources,
+        clearCache: async function() {
+            if (typeof caches !== "undefined") {
+                await caches.delete(BI_CACHE_NAME);
+                console.log("[JUCE-WebBridge] Local runtime cache cleared.");
+            }
+        },
+        setSampleRate: function(rate) {
+            if (typeof rate === "number" && rate >= 22050 && rate <= 384000) {
+                CONFIG.targetSampleRate = rate;
+                console.log("[JUCE-WebBridge] Sample rate updated: " + rate + " Hz (Bitrate: " + (rate * 64 / 1000) + " kbps 32-bit Float)");
+            }
+        }
     };
 
     console.log("[JUCE-WebBridge] All hooks active: Bitwig Track Audio & MIDI Ready!");

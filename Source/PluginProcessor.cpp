@@ -290,6 +290,15 @@ void BrowserInstrumentAudioProcessor::createPersistentBrowser()
                              int d2 = (int) obj->getProperty ("d2");
                              bridgeServer.injectMidiFromBrowser (status, d1, d2);
                          }
+                     })
+                     .withEventListener ("pageCacheStatus", [this] (const juce::var& data)
+                     {
+                         if (auto* obj = data.getDynamicObject())
+                         {
+                             int count = (int) obj->getProperty ("cachedCount");
+                             cachedAssetsCount.store (count);
+                             pageFullyCached.store (true);
+                         }
                      });
 
     browser = std::make_unique<InstrumentBrowserComponent> (
@@ -297,6 +306,8 @@ void BrowserInstrumentAudioProcessor::createPersistentBrowser()
         [this] (const juce::String& loadedUrl)
         {
             setLastLoadedUrl (loadedUrl);
+            pageFullyCached.store (false);
+            cachedAssetsCount.store (0);
             if (auto* ed = activeEditor.load())
                 ed->onBrowserUrlChanged (loadedUrl);
         },
@@ -305,7 +316,9 @@ void BrowserInstrumentAudioProcessor::createPersistentBrowser()
             if (browser)
             {
                 browser->evaluateJavascript (
-                    WebBridge::getInjectionScript (bridgeServer.getPort(), getEffectiveSampleRate()));
+                    WebBridge::getInjectionScript (bridgeServer.getPort(), getEffectiveSampleRate()) +
+                    "\nif (window.__JUCE_BRIDGE__ && typeof window.__JUCE_BRIDGE__.cacheAllPageResources === 'function') setTimeout(window.__JUCE_BRIDGE__.cacheAllPageResources, 400);"
+                );
             }
         });
 
@@ -313,6 +326,31 @@ void BrowserInstrumentAudioProcessor::createPersistentBrowser()
     if (target.trim().isEmpty() || target == "https://strudel.cc/")
         target = "https://ypc2000.fun/";
     browser->goToURL (target);
+}
+
+void BrowserInstrumentAudioProcessor::setPreferredSampleRate (int rate) noexcept
+{
+    preferredSampleRate.store (rate);
+    const int effectiveRate = getEffectiveSampleRate();
+    bridgeServer.setDawSampleRate (effectiveRate);
+    if (pulseCaptureThread != nullptr)
+        pulseCaptureThread->startCapture (effectiveRate);
+
+    if (browser != nullptr)
+    {
+        auto* b = browser.get();
+        juce::MessageManager::callAsync ([b, effectiveRate]()
+        {
+            if (b)
+            {
+                b->evaluateJavascript (
+                    "if (window.__JUCE_BRIDGE__ && typeof window.__JUCE_BRIDGE__.setSampleRate === 'function') {"
+                    "    window.__JUCE_BRIDGE__.setSampleRate(" + juce::String (effectiveRate) + ");"
+                    "}"
+                );
+            }
+        });
+    }
 }
 
 void BrowserInstrumentAudioProcessor::reattachBrowserToHiddenHost()

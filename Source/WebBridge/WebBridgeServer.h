@@ -49,6 +49,12 @@ public:
   }
   void setDawSampleRate(int rate) noexcept { dawSampleRate.store(rate); }
   int getDawSampleRate() const noexcept { return dawSampleRate.load(); }
+  int getActiveBitrateKbps() const noexcept {
+    int rate = dawSampleRate.load();
+    if (rate <= 0)
+      rate = 48000;
+    return (rate * 32 * 2) / 1000; // 32-bit Float Stereo uncompressed bitrate in kbps
+  }
 
   void notifyNativeAudioReceived() noexcept {
     nativeIpcActive.store(true);
@@ -878,7 +884,7 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
     }
   }
 
-  static constexpr int ringBufferSize = 65536;
+  static constexpr int ringBufferSize = 131072;
 
   std::atomic<bool> shouldStop{false};
   std::atomic<int> activePort{8788};

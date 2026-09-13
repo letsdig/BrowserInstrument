@@ -52,12 +52,20 @@ public:
     bool isDawPlaying() const noexcept { return wasDawPlaying.load(); }
     double getDawBpm() const noexcept { return lastDawBpm.load(); }
 
-    void setPreferredSampleRate (int rate) noexcept { preferredSampleRate.store (rate); }
+    void setPreferredSampleRate (int rate) noexcept;
     int getPreferredSampleRate() const noexcept { return preferredSampleRate.load(); }
     int getEffectiveSampleRate() const noexcept
     {
         int p = preferredSampleRate.load();
         return p > 0 ? p : (bridgeServer.getDawSampleRate() > 0 ? bridgeServer.getDawSampleRate() : 48000);
+    }
+
+    int getCachedAssetsCount() const noexcept { return cachedAssetsCount.load(); }
+    bool isPageFullyCached() const noexcept { return pageFullyCached.load(); }
+    void setPageFullyCached (bool cached, int count = 0)
+    {
+        pageFullyCached.store (cached);
+        cachedAssetsCount.store (count);
     }
 
     InstrumentBrowserComponent* getOrCreateBrowser();
@@ -89,6 +97,8 @@ private:
     std::atomic<bool> wasDawPlaying { false };
     std::atomic<double> lastDawBpm { 120.0 };
     std::atomic<int> preferredSampleRate { 0 };
+    std::atomic<int> cachedAssetsCount { 0 };
+    std::atomic<bool> pageFullyCached { false };
 
     juce::String currentUrl { "https://ypc2000.fun/" };
 

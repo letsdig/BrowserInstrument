@@ -72,6 +72,8 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     bufferSizeCombo.addItem ("BUFFER: 512 smp (~10ms) [SAFE]", 4);
     bufferSizeCombo.addItem ("BUFFER: 1024 smp (~21ms)", 5);
     bufferSizeCombo.addItem ("BUFFER: 2048 smp (~43ms)", 6);
+    bufferSizeCombo.addItem ("BUFFER: 4096 smp (~85ms)", 7);
+    bufferSizeCombo.addItem ("BUFFER: 8192 smp (~170ms)", 8);
 
     int currentCushion = processorRef.getBridgeServer().getJitterCushionSamples();
     if (currentCushion <= 64)         bufferSizeCombo.setSelectedId (1, juce::dontSendNotification);
@@ -79,7 +81,9 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     else if (currentCushion <= 256)   bufferSizeCombo.setSelectedId (3, juce::dontSendNotification);
     else if (currentCushion <= 512)   bufferSizeCombo.setSelectedId (4, juce::dontSendNotification);
     else if (currentCushion <= 1024)  bufferSizeCombo.setSelectedId (5, juce::dontSendNotification);
-    else                              bufferSizeCombo.setSelectedId (6, juce::dontSendNotification);
+    else if (currentCushion <= 2048)  bufferSizeCombo.setSelectedId (6, juce::dontSendNotification);
+    else if (currentCushion <= 4096)  bufferSizeCombo.setSelectedId (7, juce::dontSendNotification);
+    else                              bufferSizeCombo.setSelectedId (8, juce::dontSendNotification);
 
     bufferSizeCombo.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff12141c));
     bufferSizeCombo.setColour (juce::ComboBox::textColourId, juce::Colour (0xff00f4f4));
@@ -97,6 +101,8 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
         else if (id == 4) smp = 512;
         else if (id == 5) smp = 1024;
         else if (id == 6) smp = 2048;
+        else if (id == 7) smp = 4096;
+        else if (id == 8) smp = 8192;
 
         processorRef.getBridgeServer().setJitterCushionSamples (smp);
     };
