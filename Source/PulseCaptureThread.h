@@ -22,6 +22,8 @@ public:
     void startCapture (int sampleRate)
     {
         int rate = sampleRate > 0 ? sampleRate : 48000;
+        if (targetSampleRate.load() == rate && isThreadRunning())
+            return;
         targetSampleRate.store (rate);
         ensureSinkExists (rate);
         if (! isThreadRunning())
@@ -33,7 +35,7 @@ public:
     void stopCapture()
     {
         signalThreadShouldExit();
-        stopThread (1500);
+        stopThread (500);
     }
 
     void run() override
@@ -95,6 +97,10 @@ public:
 
     static void ensureSinkExists (int targetRate = 96000)
     {
+        static std::atomic<bool> sinkAlreadyVerified { false };
+        if (sinkAlreadyVerified.load())
+            return;
+
         const int rate = targetRate > 0 ? targetRate : 96000;
         const int sinkCheck = ::system ("pactl list sinks short 2>/dev/null | grep -q 'BrowserInstrumentSink'");
         if (sinkCheck != 0)
@@ -104,6 +110,7 @@ public:
                              + " channels=2 format=float32le sink_properties=device.description=BrowserInstrumentSink >/dev/null 2>&1";
             ::system (cmd.toRawUTF8());
         }
+        sinkAlreadyVerified.store (true);
     }
 
 private:

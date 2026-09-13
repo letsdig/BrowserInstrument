@@ -1,6 +1,6 @@
 {
   "Name": "BrowserInstrument",
-  "Version": "1.0.0",
+  "Version": "1.0.1",
   "Factory Info": {
     "Vendor": "AudioWebLab",
     "URL": "",
@@ -17,7 +17,7 @@
       "Category": "Audio Module Class",
       "Name": "BrowserInstrument",
       "Vendor": "AudioWebLab",
-      "Version": "1.0.0",
+      "Version": "1.0.1",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Instrument",
@@ -33,7 +33,7 @@
       "Category": "Component Controller Class",
       "Name": "BrowserInstrument",
       "Vendor": "AudioWebLab",
-      "Version": "1.0.0",
+      "Version": "1.0.1",
       "SDKVersion": "VST 3.8.0",
       "Sub Categories": [
         "Instrument",

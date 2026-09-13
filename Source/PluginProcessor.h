@@ -73,6 +73,7 @@ public:
     void createPersistentBrowser();
 
     void reattachBrowserToHiddenHost();
+    void detachBrowserFromHiddenHost();
     juce::Component* getHiddenHost() const noexcept { return hiddenHost.get(); }
 
 private:

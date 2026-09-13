@@ -6,6 +6,7 @@ BrowserInstrumentAudioProcessorEditor::BrowserInstrumentAudioProcessorEditor (Br
     : AudioProcessorEditor (&p), processorRef (p)
 {
     processorRef.setEditor (this);
+    processorRef.detachBrowserFromHiddenHost();
 
     // 1. Attach persistent browser owned by AudioProcessor (so it keeps playing even when closed!)
     auto* browser = processorRef.getOrCreateBrowser();

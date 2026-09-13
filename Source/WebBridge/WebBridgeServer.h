@@ -10,6 +10,10 @@
 #include <mutex>
 #include <vector>
 
+#if JUCE_LINUX
+#include <sys/socket.h>
+#endif
+
 namespace WebBridge {
 
 class WebBridgeServer : public juce::Thread {
@@ -462,9 +466,15 @@ private:
 
     ~ClientWorkerThread() override {
       signalThreadShouldExit();
-      if (socket != nullptr)
+      if (socket != nullptr) {
+#if JUCE_LINUX
+        int fd = socket->getRawSocketHandle();
+        if (fd >= 0)
+          ::shutdown(fd, SHUT_RDWR);
+#endif
         socket->close();
-      stopThread(1000);
+      }
+      stopThread(200);
     }
 
     void run() override { server.runWebSocketLoop(*socket); }
@@ -849,8 +859,13 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
 
   void sendWebSocketFrame(uint8_t opcode, const uint8_t *payload,
                           size_t payloadLen) {
-    std::lock_guard<std::mutex> lock(socketWriteMutex);
-    std::lock_guard<std::mutex> wlock(workerMutex);
+    std::unique_lock<std::mutex> lock(socketWriteMutex, std::try_to_lock);
+    if (!lock.owns_lock())
+      return;
+
+    std::unique_lock<std::mutex> wlock(workerMutex, std::try_to_lock);
+    if (!wlock.owns_lock())
+      return;
 
     if (activeWorkers.empty())
       return;
@@ -879,6 +894,13 @@ p { color: #94a3b8; font-size: 14px; line-height: 1.6; }
     for (auto &w : activeWorkers) {
       if (w != nullptr && w->getSocket() != nullptr &&
           w->getSocket()->isConnected()) {
+#if JUCE_LINUX
+        int fd = w->getSocket()->getRawSocketHandle();
+        if (fd >= 0) {
+          ::send(fd, frame.data(), frame.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
+          continue;
+        }
+#endif
         w->getSocket()->write(frame.data(), static_cast<int>(frame.size()));
       }
     }

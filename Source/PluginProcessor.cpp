@@ -111,8 +111,9 @@ void BrowserInstrumentAudioProcessor::prepareToPlay (double sampleRate, int /*sa
 
 void BrowserInstrumentAudioProcessor::releaseResources()
 {
-    if (pulseCaptureThread != nullptr)
-        pulseCaptureThread->stopCapture();
+    // Do not kill the pulse capture thread or bridge server on standard DAW suspend/mute cycles.
+    // Stopping threads here blocks the audio engine and causes DAW freezes.
+    bridgeServer.flushAudioBuffer();
 }
 
 bool BrowserInstrumentAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -375,6 +376,14 @@ void BrowserInstrumentAudioProcessor::reattachBrowserToHiddenHost()
         hiddenHost->addAndMakeVisible (*browser);
         browser->setBounds (hiddenHost->getLocalBounds());
     });
+}
+
+void BrowserInstrumentAudioProcessor::detachBrowserFromHiddenHost()
+{
+    if (hiddenHost != nullptr)
+    {
+        hiddenHost->setVisible (false);
+    }
 }
 
 bool BrowserInstrumentAudioProcessor::hasEditor() const
