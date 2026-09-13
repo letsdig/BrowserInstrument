@@ -7,16 +7,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Check local JUCE installation or fallback to FetchContent
 if(NOT TARGET juce::juce_core)
-    if(EXISTS "/home/kp-power/Scrivania/JUCE")
-        add_subdirectory(/home/kp-power/Scrivania/JUCE ${CMAKE_CURRENT_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
+    if(DEFINED JUCE_PATH AND EXISTS "${JUCE_PATH}/CMakeLists.txt")
+        add_subdirectory("${JUCE_PATH}" ${CMAKE_CURRENT_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
+    elseif(DEFINED ENV{JUCE_PATH} AND EXISTS "$ENV{JUCE_PATH}/CMakeLists.txt")
+        add_subdirectory("$ENV{JUCE_PATH}" ${CMAKE_CURRENT_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE/CMakeLists.txt")
+        add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../JUCE" ${CMAKE_CURRENT_BINARY_DIR}/JUCE EXCLUDE_FROM_ALL)
     else()
-        include(FetchContent)
-        FetchContent_Declare(
-            JUCE
-            GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-            GIT_TAG 8.0.4
-        )
-        FetchContent_MakeAvailable(JUCE)
+        find_package(JUCE CONFIG QUIET)
+        if(NOT TARGET juce::juce_core)
+            include(FetchContent)
+            FetchContent_Declare(
+                JUCE
+                GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+                GIT_TAG 8.0.4
+            )
+            FetchContent_MakeAvailable(JUCE)
+        endif()
     endif()
 endif()
 
